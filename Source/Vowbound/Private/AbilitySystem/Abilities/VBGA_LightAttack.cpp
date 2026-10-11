@@ -22,6 +22,11 @@ UVBGA_LightAttack::UVBGA_LightAttack()
 	ActivationOwnedTags.AddTag(VBGameplayTags::State_Combat_Attacking);
 	ActivationOwnedTags.AddTag(VBGameplayTags::State_Combat_Attacking_Light);
 
+	// 공격 버튼이 처형을 연다(user 결정 2026-09-19 — 「공격 버튼만 눌러도 바로 자연스럽게」).
+	// 부모의 기본값은 false 다. 여기서만 켜는 이유: 같은 부모를 적 공격(UVBGA_EnemyMeleeAttack)이
+	//   쓰므로 부모에서 켜면 적이 플레이어를 처형한다. 켜는 자리를 한 곳에 둔다.
+	bCanOpenFinisher = true;
+
 	// 가드⊥공격 게이트를 양방향으로 완성 (FIND-054, 2026-07-26)
 	// 가드 중(State.Combat.Guarding 보유)에는 경공격이 활성화되지 않는다.
 	// 왜: 반대 방향은 이미 막혀 있었다(UVBGA_Guard 가 Attacking 차단, VBGA_Guard.cpp:31). 이쪽만 비어 있어
@@ -33,7 +38,7 @@ UVBGA_LightAttack::UVBGA_LightAttack()
 	//   무음 실패하는 것이 기각의 1차 근거였으나, FIND-063 대응으로 Ability.Defense.Guard 가 심겼다(VBGA_Guard ctor).
 	//   즉 이제 기술적으로는 가능하다. 그럼에도 기각을 유지하는 근거는 아래 부작용과 phase-2 슬롯 예약이다.
 	//   취소 경로는 가드 End 섹션(복귀 루트모션)이 공격 블렌드아웃에 먹히는 부작용도 동반한다.
-	// 왜 GAS 네이티브인가: 커스텀 판정 코드 0줄 — UVBGA_HitReact 의 뚝심/사망 게이트와 동일 패턴
+	// 왜 GAS 네이티브인가: 커스텀 판정 코드 0줄 — UVBGA_HitReact 의 슈퍼아머/사망 게이트와 동일 패턴
 	//   (VBGA_HitReact.cpp:44-50 + 헤더 주석 :24-25 "능력이 활성화되지 않음").
 	// 부작용(의도된 예약): "가드 중 공격" 슬롯이 비워진 채 예약된다. DEC-009 phase-2 리포스트가 그 슬롯의
 	//   주인이며, 그때는 리포스트 전용 GA 만 이 태그를 차단하지 않게 만들면 된다.
@@ -46,6 +51,10 @@ UVBGA_LightAttack::UVBGA_LightAttack()
 	// 이로써 게이트가 양방향으로 닫힌다: 가드 중이면 Guarding 이, 창이 열려 있으면 RiposteWindow 가 경공격을 막는다.
 	//   두 태그 모두 없을 때만 경공격이 이 입력의 주인이다.
 	ActivationBlockedTags.AddTag(VBGameplayTags::State_Combat_RiposteWindow);
+	// 회피 커밋 (2026-09-05, design §7): 회피 시작 AttackCancelSeconds 안에는 경공격이 롤을 끊지 못한다.
+	//   입력은 버려지지 않는다 - AVBCharacter 가 저장했다가 커밋이 풀리면 내보낸다(ConsumePendingAttackInput).
+	//   user 「회피하다가 바로 공격하면 회피 도중에 끊긴다」. 회피 자체는 공격을 언제든 끊는다(비대칭이 의도).
+	ActivationBlockedTags.AddTag(VBGameplayTags::State_Combat_DodgeCommit);
 
 	// 사망 게이트 (FIND-067). 사망 구현으로 State.Dead 가 처음 켜지는 순간 "시체가 공격한다"가 된다.
 	// CancelAllAbilities() 는 *이미 활성인* GA 만 끄고 신규 활성화는 못 막으므로 태그 게이트가 필수.

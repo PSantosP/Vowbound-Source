@@ -7,9 +7,15 @@
 #include "AbilitySystem/Attributes/VBHealthAttributeSet.h"
 #include "AbilitySystem/Attributes/VBReputationAttributeSet.h"
 #include "SaveSystem/VBSaveGameTypes.h"
+#include "SaveSystem/VBSaveGame.h"
+#include "SaveSystem/VBSaveParticipantSubsystem.h"
+#include "Inventory/VBInventoryComponent.h"
+#include "Inventory/Equipment/VBEquipmentComponent.h"
+#include "Progression/VBProgressionComponent.h"
+#include "Narrative/Quest/VBQuestLogComponent.h"
 #include "Character/VBCharacter.h"
 #include "Character/VBWeaponStateComponent.h"
-#include "Character/VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "Vowbound/Vowbound.h"
 
 AVBPlayerState::AVBPlayerState()
@@ -30,6 +36,11 @@ AVBPlayerState::AVBPlayerState()
 	
 	ReputationAttributeSet = CreateDefaultSubobject<UVBReputationAttributeSet>(
 		TEXT("ReputationAttributeSet"));
+
+	InventoryComponent = CreateDefaultSubobject<UVBInventoryComponent>(TEXT("Inventory"));
+	EquipmentComponent = CreateDefaultSubobject<UVBEquipmentComponent>(TEXT("Equipment"));
+	ProgressionComponent = CreateDefaultSubobject<UVBProgressionComponent>(TEXT("Progression"));
+	QuestLogComponent = CreateDefaultSubobject<UVBQuestLogComponent>(TEXT("QuestLog"));
 
 	// 저장 대상은 플레이어가 실제로 소유한 값뿐이다. 상한(Max*)은 여기 없다 - GE 가 소유한다.
 	// 왜(FIND-078): Max* 를 주는 것은 GE_InitStats_Player 의 OVERRIDE 하나뿐인데, 세이브가 그 값을
@@ -99,6 +110,35 @@ void AVBPlayerState::MarkStartupEffectsApplied()
 	bStartupEffectsApplied = true;
 }
 
+void AVBPlayerState::PostInitializeComponents()
+{
+	Super::PostInitializeComponents();
+	UVBSaveParticipantSubsystem::Register(this);
+}
+
+void AVBPlayerState::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	UVBSaveParticipantSubsystem::Unregister(this);
+	Super::EndPlay(EndPlayReason);
+}
+
+void AVBPlayerState::WriteSave(UVBSaveGame& Save, const FVBSaveContext& Context)
+{
+	// base 값을 읽는다(SnapshotBuild 주석, FIND-047) - 버프가 걸린 채 저장해도 버프가 base 로 구워지지 않는다.
+	if (Context.PlayerState == this)
+	{
+		SnapshotBuild(Save.PlayerBuild);
+	}
+}
+
+void AVBPlayerState::ReadSave(const UVBSaveGame& Save, const FVBSaveContext& Context)
+{
+	if (Context.PlayerState == this)
+	{
+		ApplyBuild(Save.PlayerBuild);
+	}
+}
+
 void AVBPlayerState::SnapshotBuild(FVBPlayerBuildSaveData& Out) const
 {
 	// 저장 대상은 SavedAttributes 하나다(생성자에 나열). ApplyBuild 가 같은 배열을 돌아 목록이 갈리지 않는다.
@@ -139,6 +179,13 @@ void AVBPlayerState::SnapshotBuild(FVBPlayerBuildSaveData& Out) const
 			{
 				Out.EquippedWeaponId = FName(*StaticEnum<EVBWeaponType>()->GetNameStringByValue((int64)T));
 			}
+			// 가진 무기도 같은 이름 문자열로. 이것이 없으면 프롤로그에서 주운 무기가 이어하기 뒤 맵 시작값(맨몸)으로 돌아간다.
+			Out.OwnedWeaponIds.Reset();
+			for (const EVBWeaponType Owned : W->GetOwnedWeapons())
+			{
+				Out.OwnedWeaponIds.Add(FName(*StaticEnum<EVBWeaponType>()->GetNameStringByValue((int64)Owned)));
+			}
+			Out.bOwnedWeaponsSaved = true;
 		}
 	}
 }
@@ -184,6 +231,30 @@ void AVBPlayerState::ApplyBuild(const FVBPlayerBuildSaveData& In)
 				ASC->SetNumericAttributeBase(Attribute, ClampToCap(*ASC, Attribute, *Value));
 			}
 			// 키 부재 = 그 어트리뷰트가 없던 시절의 구 세이브. 초기화 GE 값을 유지한다(하위호환 경로).
+		}
+	}
+
+	// 가진 무기 복원 - 재소환보다 먼저. 꺼내기 관문(ServerSummonWeapon)이 이 목록을 묻기 때문이다.
+	//   옛 세이브(칸 없음)는 건드리지 않는다 - 맵 시작값(UVBWeaponStateComponent::InitializeComponent)이 남는다.
+	if (In.bOwnedWeaponsSaved)
+	{
+		if (AVBCharacter* C = Cast<AVBCharacter>(GetPawn()))
+		{
+			if (UVBWeaponStateComponent* W = C->GetWeaponStateComponent())
+			{
+				TArray<EVBWeaponType> Owned;
+				for (const FName& Id : In.OwnedWeaponIds)
+				{
+					const int64 Val = StaticEnum<EVBWeaponType>()->GetValueByNameString(Id.ToString());
+					if (Val == INDEX_NONE)
+					{
+						VB_LOG(Warning, "ApplyBuild: 가진 무기 %s 를 모른다 - 버린다(enum 이름이 바뀌었나)", *Id.ToString());
+						continue;
+					}
+					Owned.Add((EVBWeaponType)Val);
+				}
+				W->SetOwnedWeapons(Owned);
+			}
 		}
 	}
 

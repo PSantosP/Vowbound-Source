@@ -1,11 +1,13 @@
 ﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #include "GameModes/VBGameState.h"
+#include "Narrative/Story/VBStoryStateComponent.h"
 #include "Net/UnrealNetwork.h"
 
 AVBGameState::AVBGameState()
 {
 	bReplicates = true;
+	StoryState = CreateDefaultSubobject<UVBStoryStateComponent>(TEXT("StoryState"));
 }
 
 void AVBGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const

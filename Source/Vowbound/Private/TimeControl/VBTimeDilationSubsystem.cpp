@@ -157,9 +157,65 @@ void UVBTimeDilationSubsystem::Resolve()
 
 void UVBTimeDilationSubsystem::SetActorDilation(AActor* Actor, float Scale)
 {
-	// 문서 컨벤션 — 지금 배선된 곳 없음. per-actor 배율(플레이어 빠름/적 느림)의 미래 진입점.
+	// 2026-09-05: 히트스톱 «전투원 한정» 이 PushActorTimed 로 이 축을 처음 쓴다. 이 정적 헬퍼는 그대로 둔다(무기한 설정용).
 	if (Actor)
 	{
 		Actor->CustomTimeDilation = Scale;
 	}
+}
+
+void UVBTimeDilationSubsystem::PushActorTimed(AActor* Actor, FName Handle, float Scale, float RealDuration)
+{
+	UWorld* World = GetWorld();
+	if (!Actor || !World || RealDuration <= 0.0f) return;
+	Scale = FMath::Max(Scale, KINDA_SMALL_NUMBER);
+	const TWeakObjectPtr<AActor> Key(Actor);
+	TMap<FName, FVBTimeDilationRequest>& Requests = ActorRequests.FindOrAdd(Key);
+	if (FVBTimeDilationRequest* Existing = Requests.Find(Handle))
+	{
+		World->GetTimerManager().ClearTimer(Existing->ExpiryTimer);   // 같은 handle 재요청 = 교체(중첩 아님)
+	}
+	FVBTimeDilationRequest Request;
+	Request.Scale = Scale;
+	// 월드 타이머는 전역 배율만 받는다. 액터 배율은 월드 시간에 영향이 없으므로 곱하지 않는다.
+	const float GameDelay = RealDuration * AppliedScale;
+	World->GetTimerManager().SetTimer(
+		Request.ExpiryTimer,
+		FTimerDelegate::CreateUObject(this, &UVBTimeDilationSubsystem::OnActorRequestExpired, Key, Handle),
+		GameDelay,
+		false);
+	Requests.Add(Handle, Request);
+	ResolveActor(Key);
+}
+
+void UVBTimeDilationSubsystem::OnActorRequestExpired(TWeakObjectPtr<AActor> Actor, FName Handle)
+{
+	if (TMap<FName, FVBTimeDilationRequest>* Requests = ActorRequests.Find(Actor))
+	{
+		Requests->Remove(Handle);
+		ResolveActor(Actor);
+		if (Requests->IsEmpty())
+		{
+			ActorRequests.Remove(Actor);
+		}
+	}
+}
+
+void UVBTimeDilationSubsystem::ResolveActor(const TWeakObjectPtr<AActor>& Actor)
+{
+	AActor* Live = Actor.Get();
+	if (!Live)
+	{
+		ActorRequests.Remove(Actor);   // 사라진 액터의 요청은 버린다
+		return;
+	}
+	float Target = 1.0f;
+	if (const TMap<FName, FVBTimeDilationRequest>* Requests = ActorRequests.Find(Actor))
+	{
+		for (const TPair<FName, FVBTimeDilationRequest>& Pair : *Requests)
+		{
+			Target = FMath::Min(Target, Pair.Value.Scale);
+		}
+	}
+	Live->CustomTimeDilation = Target;
 }

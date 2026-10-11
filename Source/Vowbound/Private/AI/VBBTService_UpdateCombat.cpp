@@ -1,4 +1,4 @@
-// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #include "AI/VBBTService_UpdateCombat.h"
 
@@ -10,8 +10,8 @@
 #include "GameFramework/Pawn.h"
 #include "AI/VBCombatTypes.h"
 #include "AI/VBEnemyCombatComponent.h"
-#include "Data/VBEnemyConfig.h" // AttackCommitDistance - 접근 정지 거리의 홈
 #include "AbilitySystem/VBAbilitySystemStatics.h"
+#include "AbilitySystemGlobals.h" // 포커스 게이트 - 폰의 ASC 로 공격 중인지 묻는다
 
 UVBBTService_UpdateCombat::UVBBTService_UpdateCombat(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -111,6 +111,10 @@ void UVBBTService_UpdateCombat::TickNode(UBehaviorTreeComponent& OwnerComp, uint
 	// 블랙보드가 진실이다. 멱등이라 같은 값을 매 주기 넘겨도 기존 결정이 보존된다.
 	CombatComponent->SetCombatTarget(Target);
 
+	// 걸음. 판단과 적용은 컴포넌트가 하고 이 서비스는 «매 주기 한 번» 만 보장한다
+	//   (design .sw/enemy-gait/design.md §4). 대상이 없을 때도 불러야 전투가 끝난 적이 걷는 상태로 돌아간다.
+	CombatComponent->UpdateGait();
+
 	if (!Target)
 	{
 		AIController->ClearFocus(EAIFocusPriority::Gameplay);
@@ -121,15 +125,36 @@ void UVBBTService_UpdateCombat::TickNode(UBehaviorTreeComponent& OwnerComp, uint
 	// AVBEnemyBase 생성자가 bUseControllerDesiredRotation=true 로 두었으므로 컨트롤러의 포커스가
 	// 곧 폰의 회전 목표다. 포커스를 안 주면 적은 이동 방향만 보고, 슬롯에서 대기하는 적이 플레이어에게
 	// 등을 돌린다. 회전 속도는 UVBEnemyConfig::RotationRate 가 이미 데이터로 갖고 있다.
-	AIController->SetFocus(Target, EAIFocusPriority::Gameplay);
+	//
+	// 경직·다운 중에는 포커스를 끊는다 (2026-09-28, user 「엎어진 보스가 나를 향해 계속 회전한다」).
+	//   데코레이터는 이동·공격 분기만 닫고 이 서비스는 루트에서 계속 돌기 때문에, 포커스가 곧 회전 목표인 이 배선에서는
+	//   경직 몽타주와 엎드린 몸이 매 주기 플레이어 쪽으로 돌려 세워졌다. 포커스가 없으면 컨트롤러는 폰의 현재 회전을
+	//   그대로 목표로 삼아 돌지 않는다(AIController.cpp::AAIController::UpdateControlRotation - 포컬 포인트가 없으면
+	//   bSetControlRotationFromPawnOrientation 경로, 기본 true). 경직이 끝나면 다음 주기가 다시 포커스를 준다.
+	//   판정은 태그 하나(Staggered)다 - 다운은 같은 태그를 함께 드므로 따로 세지 않는다. 사망은 위에서 이미 끊었다.
+	// 처형 창이 켜진 동안(반응 대기 + 열림)도 끊는다 (2026-09-29, user 「왜 날 보고 처형 준비 자세를 해 - 뒷자세로 있으면 그 상태로」).
+	//   종전에는 창이 경직을 이어받으면서 이 게이트가 풀려, 무릎 꿇는 몸이 대기 내내 플레이어 쪽으로 돌았다.
+	//   단 창이 안 끊기는 반격을 기다리는 동안(공격 중)은 포커스를 둔다 - 반격이 끝까지 플레이어를 겨눠야 한다(같은 날 user 결정).
+	//   ASC 는 한 번만 찾는다 - 세 질의가 같은 폰을 본다(2026-09-30 /sw:verify).
+	const UAbilitySystemComponent* PawnASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Pawn);
+	const bool bWindowOwnsFacing = UVBAbilitySystemStatics::IsFinisherWindowArmed(PawnASC) &&
+		!UVBAbilitySystemStatics::IsAttacking(PawnASC);
+	if (UVBAbilitySystemStatics::IsStaggered(PawnASC) || bWindowOwnsFacing)
+	{
+		AIController->ClearFocus(EAIFocusPriority::Gameplay);
+	}
+	else
+	{
+		AIController->SetFocus(Target, EAIFocusPriority::Gameplay);
+	}
 
 	// 접근 정지 거리. 이 적의 아키타입 자산이 정한 값을 그대로 내보낸다.
 	// 왜 매 주기 쓰는가: 적마다 자산이 다르고 트리는 하나다. 한 번만 쓰면 다른 아키타입의 적이
 	//   앞서 쓴 값을 물려받는다 - 블랙보드는 AI 인스턴스마다 따로지만 이 값은 폰이 바뀌면 낡는다.
-	if (const UVBEnemyConfig* CombatConfig = CombatComponent->GetCombatConfig())
-	{
-		Blackboard->SetValueAsFloat(AttackRangeKey.SelectedKeyName, CombatConfig->AttackCommitDistance);
-	}
+	// 계획된 공격이 있으면 그 시작 거리(클립 전진 + 멈추는 거리), 없으면 자산의 AttackCommitDistance (design .sw/boss/design.md §12.7).
+	//   «계획이 바뀐 순간» 은 컴포넌트가 AVBAIController::PushAttackStartDistance 로 직접 쓴다(§12.11) - 이 주기 쓰기만으로는
+	//   토큰 부여 뒤 MoveTo 가 이전 값을 읽는다. 여기 쓰기는 폰 교체·자산 폴백을 덮는 뒷받침이다.
+	Blackboard->SetValueAsFloat(AttackRangeKey.SelectedKeyName, CombatComponent->GetAttackStartDistance());
 
 	Blackboard->SetValueAsEnum(CombatRoleKey.SelectedKeyName, static_cast<uint8>(CombatComponent->GetRole()));
 	Blackboard->SetValueAsVector(SlotLocationKey.SelectedKeyName, CombatComponent->GetSlotLocation());

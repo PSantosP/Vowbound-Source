@@ -2,34 +2,27 @@
 
 #include "Player/VBMenuPlayerController.h"
 
-#include "UI/VBMainMenuWidget.h"
-#include "Blueprint/UserWidget.h"
+#include "AbilitySystem/VBGameplayTags.h"
+#include "UI/VBUIManagerSubsystem.h"
 #include "Vowbound/Vowbound.h"
 
 void AVBMenuPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
 
-	bShowMouseCursor = true;
-
-	if (!MainMenuWidgetClass)
-	{
-		// 클래스 미할당은 BP 설정 누락 — 로그로 표면화(조용한 빈 화면 방지).
-		VB_LOG(Warning, "[VBMenuPlayerController] MainMenuWidgetClass 미할당 — 메뉴가 표시되지 않습니다.");
-		return;
-	}
-
-	MainMenuWidget = CreateWidget<UVBMainMenuWidget>(this, MainMenuWidgetClass);
-	if (!MainMenuWidget)
+	if (!IsLocalController())
 	{
 		return;
 	}
-
-	MainMenuWidget->AddToViewport();
-
-	// 메뉴는 게임 입력을 받지 않고 UI 만 처리. 커서로 조작.
-	FInputModeUIOnly InputMode;
-	InputMode.SetWidgetToFocus(MainMenuWidget->TakeWidget());
-	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-	SetInputMode(InputMode);
+	// 메인 메뉴 화면을 연다. 메뉴 입력 모드·커서·초점은 그 화면의 설정을 CommonUI 가 적용한다(.sw/ui-foundation 3절) -
+	//   예전처럼 여기서 SetInputMode(UIOnly) 를 걸면 입력 모드의 주인이 둘이 된다.
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
+	{
+		UI->PushScreen(VBGameplayTags::UI_Screen_MainMenu);
+	}
+	else
+	{
+		// 조용한 빈 화면 방지.
+		VB_LOG(Warning, "[VBMenuPlayerController] UI 관리자를 못 찾았다 — 메뉴가 표시되지 않습니다.");
+	}
 }

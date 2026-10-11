@@ -4,13 +4,20 @@
 
 #include "SaveSystem/VBSaveGame.h"
 #include "Data/VBGameFlowSettings.h"
-#include "Player/VBPlayerState.h"
+#include "SaveSystem/VBSaveParticipantSubsystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"
+#include "Components/ActorComponent.h"
+#include "Templates/UnrealTemplate.h"
+#include "UObject/StrongObjectPtr.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
+#include "UObject/UnrealType.h"
 #include "Vowbound/Vowbound.h"
 
 namespace
@@ -42,6 +49,7 @@ UVBSaveGameSubsystem* UVBSaveGameSubsystem::Get(const UObject* WorldContextObjec
 void UVBSaveGameSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+	bStopping = false;
 
 	// 설정은 게임 시작 직후 어디서든 즉시 필요(메인 메뉴 옵션 등)하므로 미리 보증해 둔다.
 	LoadOrCreateSettings();
@@ -49,6 +57,9 @@ void UVBSaveGameSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UVBSaveGameSubsystem::Deinitialize()
 {
+	bStopping = true;
+	++SaveGateRevision;
+	PendingLoadId.Invalidate();
 	SettingsSave = nullptr;
 	ActiveGameSave = nullptr;
 
@@ -123,29 +134,103 @@ bool UVBSaveGameSubsystem::DoesGameSaveExist(int32 SlotIndex) const
 
 void UVBSaveGameSubsystem::SaveGameSlot(int32 SlotIndex)
 {
-	UVBSaveGame* Save = GetOrCreateActiveGameSave();
-	Save->SaveVersion = UVBSaveGame::CurrentSaveVersion;
-	Save->SaveTimestamp = FDateTime::UtcNow();
+	if (!CanWriteSlot(SlotIndex)) return;
+	TStrongObjectPtr<ThisClass> KeepAlive(this);
+	TGuardValue<bool> Saving(bSavingSnapshot, true);
+	FlushSaveToSlot(GetOrCreateActiveGameSave(), SlotIndex);
+}
+
+FVBSaveHoldToken UVBSaveGameSubsystem::BeginSaveHold(FName Reason)
+{
+	// 이미 제출한 기록은 보류로 취소할 수 없다. 장면은 실제 기록 종료 뒤 시작한다.
+	if (bStopping || bCompletingSave || !PendingWrites.IsEmpty()) return {};
+	const FVBSaveHoldToken Token = SaveHolds.Acquire(Reason);
+	if (Token.IsValid()) NotifySaveHoldsChanged();
+	return IsSaveHoldActive(Token) ? Token : FVBSaveHoldToken{};
+}
+
+bool UVBSaveGameSubsystem::ConsumeInitialNewGameStart(FGuid AttemptId)
+{
+	if (bStopping || !AttemptId.IsValid() || GameStartContext.AttemptId != AttemptId
+		|| GameStartContext.Intent != EVBGameStartIntent::NewGame || ConsumedNewGameAttempt == AttemptId) return false;
+	ConsumedNewGameAttempt = AttemptId;
+	return true;
+}
+
+bool UVBSaveGameSubsystem::EndSaveHold(const FVBSaveHoldToken& Token)
+{
+	if (bStopping || !SaveHolds.Release(Token)) return false;
+	NotifySaveHoldsChanged();
+	return true;
+}
+
+void UVBSaveGameSubsystem::NotifySaveHoldsChanged()
+{
+	++SaveGateRevision;
+	OnSaveHoldsChanged.Broadcast();
+}
+
+bool UVBSaveGameSubsystem::CanWriteSlot(int32 SlotIndex)
+{
+	FName Reason;
+	if (bStopping) Reason = TEXT("Unavailable");
+	else if (SlotIndex < 0 || SlotIndex >= MaxSlotCount) Reason = TEXT("InvalidSlot");
+	else if (SaveHolds.IsHeld()) Reason = TEXT("Held");
+	else if (bSavingSnapshot || bCompletingSave || bChangingStartContext || PendingWrites.Contains(SlotIndex)) Reason = TEXT("Busy");
+	if (Reason.IsNone()) return true;
+	VB_LOG(Warning, "게임 저장 거절: 슬롯 %d, 이유 %s", SlotIndex, *Reason.ToString());
+	// 거절 통지 안의 재요청은 방송을 반복하지 않는다.
+	if (!bCompletingSave)
+	{
+		TGuardValue<bool> Completing(bCompletingSave, true);
+		OnGameSaveRefused.Broadcast(SlotIndex, Reason);
+	}
+	return false;
+}
+
+void UVBSaveGameSubsystem::FlushSaveToSlot(UVBSaveGame* Snapshot, int32 SlotIndex)
+{
+	if (!Snapshot || bStopping) return;
+	Snapshot->SaveVersion = UVBSaveGame::CurrentSaveVersion;
+	Snapshot->SaveTimestamp = FDateTime::UtcNow();
+	const FGuid RequestId = FGuid::NewGuid();
+	PendingWrites.Add(SlotIndex, RequestId);
 
 	const FString SlotName = MakeGameSlotName(SlotIndex);
 
 	// SlotIndex 를 캡처해 완료 콜백에서 그대로 브로드캐스트. WeakObjectPtr 로 수명 안전.
 	FAsyncSaveGameToSlotDelegate Delegate;
 	Delegate.BindLambda(
-		[WeakThis = TWeakObjectPtr<UVBSaveGameSubsystem>(this), SlotIndex]
+		[WeakThis = TWeakObjectPtr<UVBSaveGameSubsystem>(this), SlotIndex, RequestId]
 		(const FString& /*Slot*/, const int32 /*UserIdx*/, bool bSuccess)
 		{
-			if (UVBSaveGameSubsystem* StrongThis = WeakThis.Get())
+			if (UVBSaveGameSubsystem* StrongThis = WeakThis.Get(); StrongThis && !StrongThis->bStopping)
 			{
+				TStrongObjectPtr<ThisClass> KeepAlive(StrongThis);
+				const FGuid* Pending = StrongThis->PendingWrites.Find(SlotIndex);
+				if (!Pending || *Pending != RequestId) return;
+				StrongThis->PendingWrites.Remove(SlotIndex);
+				TGuardValue<bool> Completing(StrongThis->bCompletingSave, true);
 				StrongThis->OnGameSaveCompleted.Broadcast(SlotIndex, bSuccess);
 			}
 		});
 
-	UGameplayStatics::AsyncSaveGameToSlot(Save, SlotName, GUserIndex, Delegate);
+#if WITH_DEV_AUTOMATION_TESTS
+	if (TestSaveDispatch)
+	{
+		TestSaveDispatch(Snapshot, SlotName, GUserIndex, Delegate);
+		return;
+	}
+#endif
+	UGameplayStatics::AsyncSaveGameToSlot(Snapshot, SlotName, GUserIndex, Delegate);
 }
 
 void UVBSaveGameSubsystem::LoadGameSlot(int32 SlotIndex)
 {
+	if (bStopping || bChangingStartContext) return;
+	const FGuid LoadId = FGuid::NewGuid();
+	const FGuid SourceAttempt = GameStartContext.AttemptId;
+	PendingLoadId = LoadId;
 	const FString SlotName = MakeGameSlotName(SlotIndex);
 
 	// 존재하지 않는 슬롯은 비동기 로드를 걸지 않고 즉시 실패 통지.
@@ -157,24 +242,36 @@ void UVBSaveGameSubsystem::LoadGameSlot(int32 SlotIndex)
 
 	FAsyncLoadGameFromSlotDelegate Delegate;
 	Delegate.BindLambda(
-		[WeakThis = TWeakObjectPtr<UVBSaveGameSubsystem>(this), SlotIndex]
+		[WeakThis = TWeakObjectPtr<UVBSaveGameSubsystem>(this), SlotIndex, LoadId, SourceAttempt]
 		(const FString& /*Slot*/, const int32 /*UserIdx*/, USaveGame* LoadedData)
 		{
 			UVBSaveGameSubsystem* StrongThis = WeakThis.Get();
-			if (!StrongThis)
+			if (!StrongThis || StrongThis->bStopping)
 			{
 				return;
 			}
 
 			UVBSaveGame* VBSave = Cast<UVBSaveGame>(LoadedData);
+			TStrongObjectPtr<ThisClass> KeepAlive(StrongThis);
+			if (StrongThis->PendingLoadId != LoadId || StrongThis->GameStartContext.AttemptId != SourceAttempt)
+			{
+				StrongThis->OnGameLoadCompleted.Broadcast(SlotIndex, false);
+				return;
+			}
+			StrongThis->PendingLoadId.Invalidate();
 			if (VBSave)
 			{
+				TGuardValue<bool> Changing(StrongThis->bChangingStartContext, true);
 				VBSave = StrongThis->MigrateIfNeeded(VBSave);
 				StrongThis->ActiveGameSave = VBSave;
 				// 로드한 슬롯이 곧 활성 슬롯 + Continue 적용 대기. LoadGameSlot(async)의 유일 호출자는 Continue 흐름이다
 				// (슬롯 목록 메타는 동기 LoadGameFromSlot 을 쓰므로 이 경로를 타지 않는다). New Game 은 StartNewGame 경유라 여기 안 옴.
 				StrongThis->ActiveSlotIndex = SlotIndex;
 				StrongThis->bPendingContinueApply = true;
+				StrongThis->GameStartContext = {FGuid::NewGuid(), EVBGameStartIntent::Continue};
+				StrongThis->SaveHolds.AdvanceGeneration(StrongThis->GameStartContext.AttemptId);
+				StrongThis->NotifySaveHoldsChanged();
+				StrongThis->OnGameStartContextChanged.Broadcast();
 			}
 			StrongThis->OnGameLoadCompleted.Broadcast(SlotIndex, VBSave != nullptr);
 		});
@@ -184,30 +281,62 @@ void UVBSaveGameSubsystem::LoadGameSlot(int32 SlotIndex)
 
 void UVBSaveGameSubsystem::DeleteGameSave(int32 SlotIndex)
 {
+	FName Reason;
+	if (bStopping) Reason = TEXT("Unavailable");
+	else if (SlotIndex < 0 || SlotIndex >= MaxSlotCount) Reason = TEXT("InvalidSlot");
+	else if (bSavingSnapshot || bCompletingSave || bChangingStartContext || PendingWrites.Contains(SlotIndex))
+		Reason = TEXT("Busy");
+	else if (SaveHolds.IsHeld() && ActiveSlotIndex == SlotIndex) Reason = TEXT("Held");
+	if (!Reason.IsNone())
+	{
+		VB_LOG(Warning, "게임 저장 삭제 거절: 슬롯 %d, 이유 %s", SlotIndex, *Reason.ToString());
+		return;
+	}
+#if WITH_DEV_AUTOMATION_TESTS
+	if (TestDeleteDispatch)
+	{
+		TestDeleteDispatch(MakeGameSlotName(SlotIndex), GUserIndex);
+		return;
+	}
+#endif
 	UGameplayStatics::DeleteGameInSlot(MakeGameSlotName(SlotIndex), GUserIndex);
 }
 
 void UVBSaveGameSubsystem::StartNewGame()
 {
+	BeginNewGame(INDEX_NONE);
+}
+
+FGuid UVBSaveGameSubsystem::BeginNewGame(int32 SlotIndex)
+{
+	if (bStopping || bChangingStartContext) return {};
+	TGuardValue<bool> Changing(bChangingStartContext, true);
 	// 기존 활성 세이브를 버리고 깨끗한 새 세이브로 교체. 기본값은 struct 멤버 초기화로 보장.
 	ActiveGameSave = Cast<UVBSaveGame>(UGameplayStatics::CreateSaveGameObject(UVBSaveGame::StaticClass()));
 
 	// 슬롯 미확정. 첫 저장 때 정해진다 - 시작만으로 슬롯을 먹지 않는다.
-	ActiveSlotIndex = INDEX_NONE;
+	ActiveSlotIndex = SlotIndex;
 
 	// '적용 대기'는 세우지 않는다 - 새 레벨에서 기본 상태를 유지해야 하므로.
 	bPendingContinueApply = false;
+	GameStartContext = {FGuid::NewGuid(), EVBGameStartIntent::NewGame};
+	PendingLoadId.Invalidate();
+	SaveHolds.AdvanceGeneration(GameStartContext.AttemptId);
+	NotifySaveHoldsChanged();
+	OnGameStartContextChanged.Broadcast();
 
 	// 디스크에 쓰지 않는다. 새 게임을 시작한 것과 그 진행을 남기겠다는 것은 다른 결정이다.
+	return GameStartContext.AttemptId;
 }
 
 void UVBSaveGameSubsystem::StartNewGameInSlot(int32 SlotIndex)
 {
-	StartNewGame();
+	if (SlotIndex < 0 || SlotIndex >= MaxSlotCount) return;
+	const FGuid Started = BeginNewGame(SlotIndex);
+	if (!Started.IsValid() || bStopping) return;
 
 	// 사용자가 목록에서 직접 고른 슬롯이므로 즉시 점유가 옳다 - 그래야 "Continue" 대상이 바로 생기고
 	// 덮어쓰기 의사도 그 자리에서 확정된다.
-	ActiveSlotIndex = SlotIndex;
 	SaveGameSlot(SlotIndex);
 }
 
@@ -280,6 +409,20 @@ int32 UVBSaveGameSubsystem::ResolveSaveSlot() const
 	return 0;
 }
 
+namespace
+{
+	// 폰 하나의 저장 문맥. 일반 저장과 체크포인트가 같은 것을 만든다.
+	FVBSaveContext MakePawnSaveContext(APawn& Pawn)
+	{
+		FVBSaveContext Context;
+		Context.World = Pawn.GetWorld();
+		Context.Pawn = &Pawn;
+		Context.PlayerController = Pawn.GetController<APlayerController>();
+		Context.PlayerState = Pawn.GetPlayerState();
+		return Context;
+	}
+}
+
 bool UVBSaveGameSubsystem::SaveCurrentGameToSlot(APawn* Pawn, int32 SlotIndex)
 {
 	if (!Pawn)
@@ -287,31 +430,128 @@ bool UVBSaveGameSubsystem::SaveCurrentGameToSlot(APawn* Pawn, int32 SlotIndex)
 		VB_LOG(Warning, "SaveCurrentGameToSlot: Pawn null — 저장 취소");
 		return false;
 	}
-	if (SlotIndex < 0 || SlotIndex >= MaxSlotCount)
+	return WriteContextToSlot(MakePawnSaveContext(*Pawn), SlotIndex);
+}
+
+bool UVBSaveGameSubsystem::SaveCheckpoint(APawn* Pawn, const FTransform& RestoreAt)
+{
+	if (!Pawn)
 	{
-		VB_LOG(Warning, "SaveCurrentGameToSlot: 슬롯 %d 는 범위 밖(0..%d) — 저장 취소", SlotIndex, MaxSlotCount - 1);
+		VB_LOG(Warning, "SaveCheckpoint: Pawn null — 저장 취소");
 		return false;
 	}
-
-	UVBSaveGame* Game = GetOrCreateActiveGameSave();
-
-	// 빌드 스냅샷(체력/실드/무기). FIND-047 해결됨(4789b33): SnapshotBuild 는 이제 `GetNumericAttributeBase` 로
-	//  base 값을 읽는다 — 복원하는 ApplyBuild 가 `Set*`(=base 설정)이므로 저장/복원이 같은 층을 쓴다.
-	//  (옛 구현은 현재값을 읽어, 버프가 걸린 채 저장하면 버프가 base 로 구워졌다.)
-	if (AVBPlayerState* PS = Pawn->GetPlayerState<AVBPlayerState>())
+	FVBSaveContext Context = MakePawnSaveContext(*Pawn);
+	Context.RestoreTransformOverride = RestoreAt;
+	const int32 Slot = VBSaveSlotPolicy::ResolveCheckpointSlot(ActiveSlotIndex, GetAllSlotMetadata());
+	if (Slot == INDEX_NONE)
 	{
-		PS->SnapshotBuild(Game->PlayerBuild);
+		// 막을 수 있는 덮어쓰기라 막는다. 슬롯 목록 화면에서 저장해 활성 슬롯이 정해지면 그 뒤 체크포인트는 그 슬롯에 쓴다.
+		VB_LOG(Warning, "SaveCheckpoint: 활성 슬롯이 없고 빈 슬롯도 없다 - 기존 세이브를 덮지 않고 체크포인트를 건너뛴다");
+		return false;
 	}
+	VB_LOG(Log, "SaveCheckpoint: 슬롯 %d, 돌아올 자리 %s", Slot, *RestoreAt.GetLocation().ToString());
+	return WriteContextToSlot(Context, Slot);
+}
 
-	// 위치 스냅샷 — 로드 시 WP 스트리밍-안전 복원의 목표가 된다.
-	Game->Progress.SavedPlayerTransform = Pawn->GetActorTransform();
-	Game->Progress.bHasSavedTransform = true;
+int32 VBSaveSlotPolicy::ResolveCheckpointSlot(int32 ActiveSlot, const TArray<FVBSaveSlotMeta>& Slots)
+{
+	if (ActiveSlot != INDEX_NONE)
+	{
+		return ActiveSlot;
+	}
+	for (const FVBSaveSlotMeta& Meta : Slots)
+	{
+		if (!Meta.bExists)
+		{
+			return Meta.SlotIndex;
+		}
+	}
+	return INDEX_NONE;
+}
+
+bool UVBSaveGameSubsystem::WriteContextToSlot(const FVBSaveContext& Context, int32 SlotIndex)
+{
+	if (!CanWriteSlot(SlotIndex)) return false;
+	TStrongObjectPtr<ThisClass> KeepAlive(this);
+	TGuardValue<bool> Saving(bSavingSnapshot, true);
+	const uint64 Revision = SaveGateRevision;
+	const FGuid Attempt = GameStartContext.AttemptId;
+	TStrongObjectPtr<UWorld> World(Context.World);
+	TStrongObjectPtr<APawn> Pawn(Context.Pawn);
+	TStrongObjectPtr<APlayerController> Controller(Context.PlayerController);
+	TStrongObjectPtr<APlayerState> PlayerState(Context.PlayerState);
+	const auto IsCurrent = [&]
+	{
+		FName Reason;
+		if (bStopping) Reason = TEXT("Stopping");
+		else if (Revision != SaveGateRevision) Reason = TEXT("GateRevisionChanged");
+		else if (Attempt != GameStartContext.AttemptId) Reason = TEXT("StartAttemptChanged");
+		else if (SaveHolds.IsHeld()) Reason = TEXT("Held");
+		else if (!IsValid(World.Get()) || World->bIsTearingDown) Reason = TEXT("WorldUnavailable");
+		else if (World->GetGameInstance() != GetGameInstance() || World->GetNetMode() == NM_Client) Reason = TEXT("WorldAuthority");
+		else if (!IsValid(Pawn.Get()) || Pawn->IsActorBeingDestroyed() || Pawn->GetWorld() != World.Get()) Reason = TEXT("PawnUnavailable");
+		else if (!IsValid(Controller.Get()) || Controller->IsActorBeingDestroyed() || Controller->GetWorld() != World.Get()) Reason = TEXT("ControllerUnavailable");
+		else if (Controller->GetPawn() != Pawn.Get() || Pawn->GetController() != Controller.Get()) Reason = TEXT("PossessionChanged");
+		else if (!IsValid(PlayerState.Get()) || Pawn->GetPlayerState() != PlayerState.Get() || Controller->PlayerState != PlayerState.Get()) Reason = TEXT("PlayerStateChanged");
+		if (!Reason.IsNone()) VB_LOG(Warning, "저장 문맥 거절: 슬롯 %d, 이유 %s", SlotIndex, *Reason.ToString());
+		return Reason.IsNone();
+	};
+	if (!IsCurrent()) return false;
+	// 참여자가 각자 자기 구역을 쓴다(빌드 = AVBPlayerState, 위치 = UVBPlayerRestoreComponent, 문·스위치 = UVBInteractableSubsystem,
+	//   사실 = UVBStoryStateComponent). 하나도 없으면 멈춘다 - 빈 세이브를 «저장됨» 으로 알리면 불러올 때에야 비었다는 것을 안다.
+	UVBSaveParticipantSubsystem* Registry = Context.World ? Context.World->GetSubsystem<UVBSaveParticipantSubsystem>() : nullptr;
+	const TArray<IVBSaveParticipant*> Participants = Registry ? Registry->GetParticipants() : TArray<IVBSaveParticipant*>();
+	if (Participants.Num() == 0)
+	{
+		VB_LOG(Error, "WriteContextToSlot: 이 월드에 저장 참여자가 없다 - 저장 취소(빈 세이브를 쓰지 않는다)");
+		return false;
+	}
+	TArray<TStrongObjectPtr<UObject>> Writers;
+	for (IVBSaveParticipant* Participant : Participants) Writers.Emplace(Cast<UObject>(Participant));
+	TStrongObjectPtr<UVBSaveGame> Active(GetOrCreateActiveGameSave());
+	TStrongObjectPtr<UVBSaveGame> Game(DuplicateObject(Active.Get(), GetTransientPackage()));
+	if (!Game.IsValid() || !IsCurrent()) return false;
+	for (int32 Index = 0; Index < Participants.Num(); ++Index)
+	{
+		const UObject* Object = Writers[Index].Get();
+		const UActorComponent* Component = Cast<UActorComponent>(Object);
+		const AActor* Actor = Cast<AActor>(Object);
+		if (!IsCurrent() || !IsValid(Object) || Object->GetWorld() != World.Get()
+			|| (Component && !Component->IsRegistered()) || (Actor && Actor->IsActorBeingDestroyed())) return false;
+		Participants[Index]->WriteSave(*Game.Get(), Context);
+		if (!IsCurrent()) return false;
+	}
+	if (Registry->GetParticipants() != Participants) return false;
+	VB_LOG(Log, "WriteContextToSlot: 참여자 %d 가 슬롯 %d 에 썼다", Participants.Num(), SlotIndex);
 
 	// 쓴 자리가 곧 활성 슬롯이 된다 - 이후 Continue/SaveCurrentSlot 이 같은 자리를 가리켜야 한다.
 	ActiveSlotIndex = SlotIndex;
+	Game->SaveVersion = UVBSaveGame::CurrentSaveVersion;
+	Game->SaveTimestamp = FDateTime::UtcNow();
+	// 공개 API가 돌려준 객체의 정체성은 유지하고, 검증한 저장 프로퍼티만 한 번 게시한다.
+	for (TFieldIterator<FProperty> Property(Game->GetClass()); Property; ++Property)
+	{
+		if (Property->HasAnyPropertyFlags(CPF_SaveGame)) Property->CopyCompleteValue_InContainer(Active.Get(), Game.Get());
+	}
 
-	SaveGameSlot(SlotIndex); // async → OnGameSaveCompleted
+	FlushSaveToSlot(Game.Get(), SlotIndex); // async → OnGameSaveCompleted
 	return true;
+}
+
+int32 UVBSaveGameSubsystem::ApplyActiveSave(const FVBSaveContext& Context)
+{
+	if (!ActiveGameSave)
+	{
+		VB_LOG(Error, "ApplyActiveSave: 적용할 활성 세이브가 없다");
+		return 0;
+	}
+	UVBSaveParticipantSubsystem* Registry = Context.World ? Context.World->GetSubsystem<UVBSaveParticipantSubsystem>() : nullptr;
+	const int32 Applied = Registry ? Registry->ReadAll(*ActiveGameSave, Context) : 0;
+	if (Applied == 0)
+	{
+		VB_LOG(Error, "ApplyActiveSave: 이 월드에 저장 참여자가 없다 - 세이브가 적용되지 않았다");
+	}
+	return Applied;
 }
 
 UVBSaveGame* UVBSaveGameSubsystem::GetOrCreateActiveGameSave()

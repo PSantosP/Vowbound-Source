@@ -9,6 +9,7 @@
 
 class USplineComponent;
 class UStaticMeshComponent;
+class UVBPushableComponent;
 
 /**
  * AVBLevelBlock_Traversable
@@ -38,12 +39,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Traversal")
 	void GetLedgeTransforms(const FVector& HitLocation, const FVector& ActorLocation, UPARAM(ref) FVBTraversalCheckResult& Result) const;
 
+	FORCEINLINE bool ShouldAlwaysHang() const { return bAlwaysHang; }
+	FORCEINLINE float GetMinLedgeWidth() const { return MinLedgeWidth; }
+
 protected:
 	virtual void OnConstruction(const FTransform& Transform) override;
 
 	// 장애물 메시(트레이스 대상). 디자이너가 메시 지정.
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Traversal")
 	TObjectPtr<UStaticMeshComponent> ObstacleMesh;
+	// 설정을 준 침대/상자만 활성. 기존 렛지와 부착물을 그대로 같이 이동한다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Interaction")
+	TObjectPtr<UVBPushableComponent> Pushable;
 
 	// 렛지 스플라인들 — 액터에 추가된 USplineComponent 자동 수집(OnConstruction).
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Traversal")
@@ -56,6 +63,12 @@ protected:
 	// 렛지 최소 폭. 이보다 좁으면 front 무효 + 모서리에서 절반값만큼 클램프(코너 부유 방지). GASP MinLedgeWidth.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Vowbound|Traversal")
 	float MinLedgeWidth = 60.0f;
+
+	// 이 장애물의 렛지는 높이와 무관하게 «매달림» 으로만 잡는다(디자이너 강제).
+	// 기본(false)은 벽 실높이가 정한다 - 공중에서 잡은 렛지 아래 MantleHeightMax 안에 바닥이 없으면 매달림,
+	//   있으면 종전처럼 바로 올라간다(UVBTraversalComponent::ShouldHangInsteadOfMantle).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Vowbound|Traversal")
+	bool bAlwaysHang = false;
 
 	// 캐릭터 위치에 가장 가까운 렛지 스플라인 반환(없으면 nullptr).
 	USplineComponent* FindLedgeClosestToActor(const FVector& ActorLocation) const;

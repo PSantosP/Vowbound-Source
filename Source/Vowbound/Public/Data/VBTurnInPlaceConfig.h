@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Character/VBWeaponStateTypes.h" // EVBWeaponType (행의 키)
+#include "Types/VBWeaponStateTypes.h" // EVBWeaponType (행의 키)
 #include "Engine/DataAsset.h"
 #include "VBTurnInPlaceConfig.generated.h"
 

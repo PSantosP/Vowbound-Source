@@ -2,17 +2,23 @@
 
 
 #include "Player/VBPlayerController.h"
+#include "Camera/VBPlayerCameraManager.h"
 
 #include "Player/VBPlayerState.h"
 #include "AbilitySystemComponent.h"
 #include "AbilitySystem/Attributes/VBHealthAttributeSet.h"
 #include "Character/VBCharacter.h"
+#include "Character/VBTargetLockComponent.h"
+#include "Narrative/Dialogue/VBDialogueComponent.h"
+#include "Narrative/Dialogue/VBSpokenLineComponent.h"
+#include "Inventory/Shop/VBShopComponent.h"
+#include "Inventory/VBInventoryComponent.h"
+#include "EnhancedInputComponent.h"
+#include "InputAction.h"
 #include "SaveSystem/VBSaveGameSubsystem.h"
 #include "TimeControl/VBTimeDilationSubsystem.h"
-#include "UI/VBGameOverWidget.h"
-#include "UI/VBHUDWidget.h"
-#include "UI/VBPauseMenuWidget.h"
-#include "EnhancedInputComponent.h"
+#include "AbilitySystem/VBGameplayTags.h"
+#include "UI/VBUIManagerSubsystem.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -27,40 +33,85 @@ namespace
 
 AVBPlayerController::AVBPlayerController()
 {
-	// 기본 설정
+	PlayerCameraManagerClass = AVBPlayerCameraManager::StaticClass();
+	DialogueComponent = CreateDefaultSubobject<UVBDialogueComponent>(TEXT("Dialogue"));
+	ShopComponent = CreateDefaultSubobject<UVBShopComponent>(TEXT("Shop"));
+	SpokenLineComponent = CreateDefaultSubobject<UVBSpokenLineComponent>(TEXT("SpokenLine"));
 }
 
+
+void AVBPlayerController::UpdateRotation(float DeltaTime)
+{
+	// 락온 입력은 이미 오프셋으로 수집됐다. 엔진의 pitch 제한/FaceRotation 전에 합성한다.
+	if (IsLocalController())
+	{
+		if (const AVBCharacter* VBCharacter = Cast<AVBCharacter>(GetPawn()))
+		{
+			if (UVBTargetLockComponent* Lock = VBCharacter->GetTargetLockComponent())
+			{
+				if (Lock->CanTrackCamera())
+				{
+					RotationInput = FRotator::ZeroRotator;
+					Lock->UpdateCameraRotation(DeltaTime);
+				}
+				else
+				{
+					// 다른 시점 입력 경로도 우선하며 자유 시점의 RotationInput은 지우지 않는다.
+					Lock->NotifyManualCameraInput(RotationInput.Yaw, RotationInput.Pitch);
+					Lock->UpdateHitRecenter();
+				}
+			}
+		}
+	}
+	Super::UpdateRotation(DeltaTime);
+}
 
 void AVBPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 게임플레이 입력 모드를 명시적으로 확정한다.
-	// 왜: 메인 메뉴 PC 가 FInputModeUIOnly + 마우스 커서를 켜면 그 UI 마우스 캡처 상태가
-	//     GameViewportClient(레벨 전환에도 파괴되지 않고 유지됨)에 남는다. New Game/Continue 로
-	//     이 게임플레이 레벨에 들어온 새 PC 가 재설정하지 않으면 마우스 시점(캡처 필요)과
-	//     클릭(게임이 아닌 UI로 전달)이 모두 죽는다. 직접 PIE 진입은 이미 GameOnly 라 idempotent.
+	// HUD 화면을 연다. 입력 모드(게임, 마우스 캡처)는 HUD 화면의 설정을 CommonUI 가 적용한다.
+	//   예전에는 여기서 SetInputMode(GameOnly) 로 메인 메뉴가 남긴 UI 캡처를 걷어냈다(GameViewportClient 는 레벨 전환에도
+	//   살아남는다). 지금은 HUD 가 맨 위가 되는 순간 CommonUI 가 캡처를 다시 잡는다 - 같은 일을 하는 주인이 하나다.
+	//   HUD 의 캐릭터 연결은 HUD 가 스스로 한다(빙의가 늦으면 기다린다) - 로드가 비동기라 여기서 넘길 수 없다.
 	if (IsLocalController())
 	{
-		SetInputMode(FInputModeGameOnly());
-		bShowMouseCursor = false;
-	}
-
-	// 로컬 플레이어만 HUD 생성
-	if (IsLocalController() && HUDWidgetClass)
-	{
-		HUDWidget = CreateWidget<UVBHUDWidget>(this, HUDWidgetClass);
-		
-		if (HUDWidgetClass)
+		if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
 		{
-			// 뷰포트에 추가해야 화면에 보인다.
-			HUDWidget->AddToViewport();
-			
-			// Possess된 캐릭터가 있으면 초기화
-			if (AVBCharacter* VBChar = Cast<AVBCharacter>(GetPawn()))
-			{
-				HUDWidget->InitializeHUD(VBChar);
-			}
+			UI->PushScreen(VBGameplayTags::UI_Screen_HUD);
+		}
+		else
+		{
+			VB_LOG(Warning, "[VBPC] UI 관리자를 못 찾았다 - HUD 가 안 뜬다");
+		}
+		// 대화·상점 화면은 그 컴포넌트가 아니라 여기서 연다 - 컴포넌트는 보기 바뀜만 알린다(설계 .sw/narrative 13.1절 1번).
+		DialogueComponent->OnViewChanged.AddUObject(this, &AVBPlayerController::HandleDialogueViewChanged);
+		ShopComponent->OnViewChanged.AddUObject(this, &AVBPlayerController::HandleShopViewChanged);
+	}
+}
+
+void AVBPlayerController::HandleDialogueViewChanged()
+{
+	SyncScreen(VBGameplayTags::UI_Screen_Dialogue, DialogueComponent->GetView().IsActive());
+}
+
+void AVBPlayerController::HandleShopViewChanged()
+{
+	SyncScreen(VBGameplayTags::UI_Screen_Shop, ShopComponent->GetView().IsActive());
+}
+
+void AVBPlayerController::SyncScreen(const FGameplayTag& ScreenTag, bool bWanted)
+{
+	// 이미 떠 있으면 PushScreen 이, 안 떠 있으면 PopScreen 이 아무것도 안 한다 - 보기가 여러 번 바뀌어도 한 줄로 맞춘다.
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
+	{
+		if (bWanted)
+		{
+			UI->PushScreen(ScreenTag);
+		}
+		else
+		{
+			UI->PopScreen(ScreenTag);
 		}
 	}
 }
@@ -80,15 +131,26 @@ void AVBPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();
 
-	// 게임플레이 입력은 폰(VBCharacter)이 바인드한다. PC 는 pause 만 소유 — 폰 사망과 무관하게 유지.
-	if (UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(InputComponent))
+	// 게임플레이 입력은 폰(VBCharacter)이 바인드한다 - 퀵슬롯 키만 여기다(헤더 QuickSlotActions). 일시정지 입력은 HUD 화면이 CommonUI 로 받는다(RequestPauseMenu).
+	if (UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(InputComponent))
 	{
-		if (PauseAction)
+		const UVBInventoryComponent* Inventory = UVBInventoryComponent::FindFor(this);
+		for (int32 SlotIndex = 0; SlotIndex < QuickSlotActions.Num(); ++SlotIndex)
 		{
-			EIC->BindAction(PauseAction, ETriggerEvent::Started, this, &AVBPlayerController::OpenPauseMenu);
+			if (QuickSlotActions[SlotIndex])
+			{
+				EnhancedInput->BindAction(QuickSlotActions[SlotIndex], ETriggerEvent::Started, this, &AVBPlayerController::HandleQuickSlotPressed, SlotIndex);
+			}
 		}
+		// 칸 수는 인벤토리가 정한다. PlayerState 가 아직 없으면(SetupInputComponent 는 빙의보다 먼저 돌 수 있다) 견주지 못한다 - 누를 때 서버가 범위를 다시 본다.
+		VB_CLOG(Inventory && QuickSlotActions.Num() != Inventory->GetQuickSlots().Num(), Warning,
+			"PlayerController: 퀵슬롯 키 %d 개와 칸 %d 개가 다르다 - 키 없는 칸, 또는 칸 없는 키가 있다(QuickSlotActions / QuickSlotCount)",
+			QuickSlotActions.Num(), Inventory ? Inventory->GetQuickSlots().Num() : 0);
 	}
-
+	else
+	{
+		VB_LOG(Warning, "PlayerController: InputComponent 가 Enhanced Input 이 아니다 - 퀵슬롯 키를 묶지 못했다(DefaultInput.ini DefaultInputComponentClass)");
+	}
 #if !UE_BUILD_SHIPPING
 	// 디버그 즉사 키. Enhanced Input 이 아니라 raw BindKey 라 IMC 와 무관하게 항상 먹는다.
 	// 사망 후에는 OnPlayerDeath 의 DisableInput(this) 가 이 바인딩까지 걷어가므로 시체 상태에서는 안 눌린다.
@@ -99,7 +161,25 @@ void AVBPlayerController::SetupInputComponent()
 #endif
 }
 
-void AVBPlayerController::OpenPauseMenu()
+const UInputAction* AVBPlayerController::GetQuickSlotAction(int32 SlotIndex) const
+{
+	return QuickSlotActions.IsValidIndex(SlotIndex) ? QuickSlotActions[SlotIndex].Get() : nullptr;
+}
+
+void AVBPlayerController::HandleQuickSlotPressed(int32 SlotIndex)
+{
+	// 판단은 서버가 한다(빈 칸·가진 수·조건). 여기서는 칸 번호만 보낸다.
+	if (UVBInventoryComponent* Inventory = UVBInventoryComponent::FindFor(this))
+	{
+		Inventory->RequestUseQuickSlot(SlotIndex);
+	}
+	else
+	{
+		VB_LOG(Warning, "PlayerController: 퀵슬롯 %d - 인벤토리를 찾지 못했다(PlayerState 에 UVBInventoryComponent)", SlotIndex + 1);
+	}
+}
+
+void AVBPlayerController::RequestPauseMenu()
 {
 	if (!IsLocalController())
 	{
@@ -107,78 +187,68 @@ void AVBPlayerController::OpenPauseMenu()
 	}
 	if (bGameOverActive)
 	{
-		// 게임오버 연출/화면 위에 일시정지가 겹치지 않게 한다. 폰의 DisableInput 은 폰 바인딩만 죽이고
-		// PC 자신의 PauseAction 은 살아남으므로, 이 가드가 없으면 죽은 뒤에도 Esc 가 먹힌다.
+		// 사망 연출 중에는 열지 않는다(헤더 주석: 게임오버 화면이 뜨기 전 구간은 HUD 가 맨 위다).
 		return;
 	}
-	if (PauseMenuWidget)
+	// 정지는 일시정지 화면의 데이터(bPausesGame)를 보고 UI 관리자가 건다. SP/host 전용 경계는 그대로다 -
+	//   SetPause 는 NM_Client 에서 조기 반환한다(SystemMap 15_PauseMenu).
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
 	{
-		return; // 이미 열림 — 중복 방지.
+		UI->PushScreen(VBGameplayTags::UI_Screen_Pause);
 	}
-	if (!PauseMenuWidgetClass)
+}
+
+void AVBPlayerController::RequestInventoryScreen()
+{
+	if (!IsLocalController() || bGameOverActive)
 	{
-		VB_LOG(Warning, "[VBPC] PauseMenuWidgetClass 미할당 — 일시정지 메뉴가 뜨지 않습니다.");
 		return;
 	}
-
-	// SP/host 전용 경계: APlayerController::SetPause 는 NM_Client 에서 조기 반환한다(엔진 확인).
-	// MP 로 확장하면 리모트 클라는 "메뉴는 떴는데 월드는 계속 도는" 상태가 되므로, 그때는
-	// 정지 자체를 서버 권위 경로로 옮겨야 한다(현 범위=SP/host, SystemMap 15_PauseMenu).
-	UGameplayStatics::SetGamePaused(this, true);
-
-	PauseMenuWidget = CreateWidget<UVBPauseMenuWidget>(this, PauseMenuWidgetClass);
-	if (!PauseMenuWidget)
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
 	{
-		UGameplayStatics::SetGamePaused(this, false); // 위젯 실패면 정지 되돌림.
+		UI->PushScreen(VBGameplayTags::UI_Screen_Inventory);
+	}
+}
+
+void AVBPlayerController::RequestJournalScreen()
+{
+	if (!IsLocalController() || bGameOverActive)
+	{
 		return;
 	}
-	PauseMenuWidget->AddToViewport();
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
+	{
+		UI->PushScreen(VBGameplayTags::UI_Screen_Journal);
+	}
+}
 
-	// 게임 입력 정지, UI 로 전환 + 커서. 위젯 버튼으로 조작(paused 중 Enhanced Input 미발화).
-	FInputModeUIOnly InputMode;
-	InputMode.SetWidgetToFocus(PauseMenuWidget->TakeWidget());
-	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-	SetInputMode(InputMode);
-	bShowMouseCursor = true;
+void AVBPlayerController::RequestSkillTreeScreen()
+{
+	if (!IsLocalController() || bGameOverActive)
+	{
+		return;
+	}
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
+	{
+		UI->PushScreen(VBGameplayTags::UI_Screen_SkillTree);
+	}
 }
 
 void AVBPlayerController::TeardownMenuState()
 {
-	// 메뉴 상태 해제의 단일 소스. 소비처 3곳(ResumeGame / QuitToMainMenu / RestartCurrentLevel).
-	// 순서가 계약이다: 위젯 제거 → unpause → 입력모드 GameOnly + 커서 off.
-	//   ① 위젯을 먼저 지워야 "정지 해제됐는데 오버레이만 남은" 중간 상태가 안 생긴다.
-	//   ② 입력모드 복원을 마지막에 둬야 UI 캡처가 확실히 걷힌다 — 안 하면 시점/클릭이 죽는다(입력모드 누수 교훈).
-	// 위젯 수명은 PC 가 모든 종료 경로에서 대칭으로 정리한다. OpenLevel 이 월드째 파괴하므로 기능상 필수는
-	// 아니지만, 비대칭을 남기면 "레벨 전환 없는 종료 경로"가 추가될 때 조용히 새는 지점이 된다.
-	if (PauseMenuWidget)
+	// 레벨을 떠나기 전 메뉴 화면을 내린다. 일시정지 화면이 비활성화되는 순간 UI 관리자의 정지 목록이 비어
+	//   정지가 풀린다 - 정지 상태로 레벨을 옮기지 않는다. 입력 모드는 따로 되돌리지 않는다: 다음 레벨의 HUD 화면이
+	//   맨 위가 될 때 CommonUI 가 그 설정을 적용한다.
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
 	{
-		PauseMenuWidget->RemoveFromParent();
-		PauseMenuWidget = nullptr;
+		UI->PopScreen(VBGameplayTags::UI_Screen_Pause);
+		UI->PopScreen(VBGameplayTags::UI_Screen_GameOver);
 	}
-	if (GameOverWidget)
-	{
-		GameOverWidget->RemoveFromParent();
-		GameOverWidget = nullptr;
-	}
-
-	UGameplayStatics::SetGamePaused(this, false);
-
-	if (IsLocalController())
-	{
-		SetInputMode(FInputModeGameOnly());
-		bShowMouseCursor = false;
-	}
-}
-
-void AVBPlayerController::ResumeGame()
-{
-	TeardownMenuState();
 }
 
 void AVBPlayerController::QuitToMainMenu()
 {
-	// unpause(정지 상태로 레벨 전환 금지) + 위젯 정리 + 방어적 입력모드 복원.
-	// 새 메뉴 PC 가 UIOnly 를 재확정하지만, 전환 전 GameOnly 로 되돌려 캡처 잔류를 막는다.
+	// 메뉴 화면을 내려 정지를 푼다(정지 상태로 레벨 전환 금지). 메뉴 레벨의 입력 모드는 그 레벨의 메인 메뉴 화면이 정한다.
 	TeardownMenuState();
 
 	if (!MainMenuLevel.IsNull())
@@ -211,29 +281,24 @@ void AVBPlayerController::OnPlayerDeath(float DeathAnimSeconds)
 	}
 	bGameOverActive = true;
 
-	// PC 자신의 입력도 끊는다. 폰의 DisableInput 은 폰이 바인드한 것만 죽이고 PC 가 바인드한 액션
-	// (현재 PauseAction)은 살아남기 때문이다.
-	// 왜 bGameOverActive 가드만으로 부족한가: 그 방식은 "PC 에 새 액션을 추가하는 사람이 매번 가드를
-	// 기억해야" 성립하는 규율 의존형 방어다. DisableInput 은 InputComponent 를 스택에서 통째로 pop 하므로
-	// 앞으로 어떤 액션이 추가돼도 자동으로 막힌다. bGameOverActive 는 이중화로 남긴다.
-	// 부작용 없음: 게임오버 위젯 버튼은 Slate 경로로 동작하므로 InputComponent 와 무관하다.
+	// PC 자신의 입력도 끊는다. 폰의 DisableInput 은 폰이 바인드한 것만 죽이고 PC 가 바인드한 것(지금은 디버그 키)은
+	// 살아남기 때문이다. DisableInput 은 InputComponent 를 스택에서 통째로 pop 하므로 앞으로 PC 에 어떤 액션이 추가돼도
+	// 자동으로 막힌다. 일시정지 입력은 여기서 막히지 않는다 - HUD 화면이 CommonUI 로 받으므로 bGameOverActive 가 막는다.
 	// 비가역이어도 무해한 이유는 아래 HUD 주석과 같다 - 두 출구가 모두 OpenLevel 이다.
 	DisableInput(this);
 
-	// HUD 는 Collapsed 로 감춘다. RemoveFromParent 가 아니다. 근거 4중:
-	//   ① PC 가 HUDWidget 을 직접 소유하므로 비용 1줄.
-	//   ② Collapsed 는 레이아웃뿐 아니라 히트테스트에서도 제거된다 → HP 0 짜리 바가 게임오버 버튼 클릭을
-	//      가로챌 여지가 원천 차단된다.
-	//   ③ Collapsed 위젯은 tick 되지 않는다 → UVBHUDWidget::NativeTick(락온 마커 화면 투영)이 죽은
-	//      플레이어에게 매 프레임 계속 도는 낭비가 자동으로 사라진다.
-	//      엔진 근거(2026-07-29 확인): NativeTick 은 SObjectWidget::Tick(SObjectWidget.cpp::SObjectWidget::Tick)에서만
-	//      불리고, 그건 SWidget::Paint(SWidget.cpp) 안에서만 불린다. Paint 는 arranged
-	//      children 을 따라가는데 FArrangedChildren::Accepts 가 가시성으로 거르고 Prepass 는
-	//      EVisibility::Collapsed 를 명시적으로 배제한다(SWidget.cpp::SWidget::Paint) → 배열 안 됨 = Paint 안 됨 = Tick 안 됨.
-	//   ④ 가역적 — 같은 레벨 부활을 나중에 붙일 때 Visible 한 줄로 되돌린다(RemoveFromParent 는 비가역).
-	if (HUDWidget)
+	// HUD 층을 Collapsed 로 감춘다. HUD 화면을 내리는 것이 아니다. 근거:
+	//   ① HUD 는 입력의 바닥이다(.sw/ui-foundation 2.2). 내리면 게임오버 화면이 뜨기 전 구간에 활성 화면이 하나도 없어
+	//      CommonUI 가 입력 설정을 아무도 말하지 않는 상태가 된다.
+	//   ② Collapsed 는 레이아웃뿐 아니라 히트테스트에서도 제거된다 → HP 0 짜리 바가 게임오버 버튼 클릭을 가로챌 여지가 없다.
+	//   ③ Collapsed 위젯은 tick 되지 않는다 → 락온 마커 투영이 죽은 플레이어에게 도는 낭비가 없다.
+	//      엔진 근거(2026-07-29 확인): NativeTick 은 SObjectWidget::Tick 에서만 불리고, 그건 SWidget::Paint 안에서만 불린다.
+	//      Prepass 는 EVisibility::Collapsed 를 배제한다(SWidget.cpp::SWidget::Paint) → Paint 안 됨 = Tick 안 됨.
+	//   ④ 가역적 — 같은 레벨 부활을 나중에 붙일 때 SetLayerHidden(false) 한 줄로 되돌린다.
+	UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this);
+	if (UI)
 	{
-		HUDWidget->SetVisibility(ESlateVisibility::Collapsed);
+		UI->SetLayerHidden(VBGameplayTags::UI_Layer_Game, true);
 	}
 
 	// 사망 직후 짧은 슬로모 한 박자. PushTimed(자동 만료)를 쓴다 — 서브시스템이 실시간 만료를 스스로
@@ -273,49 +338,22 @@ void AVBPlayerController::ShowGameOverMenu()
 		TimeDilation->Pop(GDeathSlowMoHandle);
 	}
 
-	if (GameOverWidget)
+	// 게임을 멈추지 않는다 (2026-07-28 user 결정: "타임 안멈춰도 돼 그냥 진행해도돼"). 게임오버 화면의 데이터가
+	//   bPausesGame=false 다. 그래서 입력 차단을 정지에 기대지 않는다. 방어선:
+	//   ① 게임오버 화면의 Menu 입력 모드 — 게임 입력 전체를 뷰포트에서 거른다(UVBGameOverWidget 생성자)
+	//   ② 폰의 DisableInput — 폰이 바인드한 Enhanced Input 전량 (AVBCharacter::HandleDeathCosmetic)
+	//   ③ PC 자신의 DisableInput(this) (OnPlayerDeath)
+	//   ④ bGameOverActive — 화면이 뜨기 전 구간의 일시정지 요청 거절(RequestPauseMenu)
+	// 초점·커서는 게임오버 화면과 CommonUI 가 맡는다. 이미 떠 있으면 UI 관리자가 무시한다.
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
 	{
-		return; // 이미 열림 — 중복 방지(OpenPauseMenu 동형).
+		UI->PushScreen(VBGameplayTags::UI_Screen_GameOver);
 	}
-	if (!GameOverWidgetClass)
+	else
 	{
 		// 조용한 실패 금지: 화면이 없으면 조작 불능인 시체만 남으므로 원인을 로그로 남긴다.
-		VB_LOG(Warning, "[VBPC] GameOverWidgetClass 미할당 — 게임오버 화면이 뜨지 않습니다.");
-		return;
+		VB_LOG(Warning, "[VBPC] UI 관리자를 못 찾았다 — 게임오버 화면이 뜨지 않습니다.");
 	}
-
-	GameOverWidget = CreateWidget<UVBGameOverWidget>(this, GameOverWidgetClass);
-	if (!GameOverWidget)
-	{
-		VB_LOG(Warning, "[VBPC] 게임오버 위젯 생성 실패 — 정지/입력모드 전환을 건너뜁니다.");
-		return;
-	}
-	GameOverWidget->AddToViewport();
-
-	// UUserWidget 은 기본이 non-focusable 이라, 이 세터가 없으면 아래 SetWidgetToFocus 가 실패한다.
-	// (실측 로그: "InputMode:UIOnly - Attempting to focus Non-Focusable widget SObjectWidget").
-	// 위젯 에셋의 IsFocusable 체크에 의존하지 않고 코드에서 보장한다 — WBP 를 새로 만들 때마다 같은 함정을
-	// 밟지 않게 하기 위함. UE5.2 부터 bIsFocusable 직접 접근이 deprecated 라 세터를 쓴다(UserWidget.h::UUserWidget::SetIsFocusable).
-	GameOverWidget->SetIsFocusable(true);
-
-	// 게임을 멈추지 않는다 (2026-07-28 user 결정: "타임 안멈춰도 돼 그냥 진행해도돼").
-	// 일시정지 메뉴와의 결정적 차이다. 그쪽은 '플레이어가 자리를 비우는' 상황이라 정지가 계약이지만,
-	// 게임오버는 월드가 계속 돌아가는 편이 연출로 낫고 시체·적·이펙트가 얼어붙지 않는다.
-	// 그래서 입력 차단을 pause 에 의존할 수 없고 코드가 직접 든다. 방어선 3중:
-	//   ① 폰의 DisableInput — 폰이 바인드한 Enhanced Input 전량 (AVBCharacter::HandleDeathCosmetic)
-	//   ② PC 자신의 DisableInput(this) — PC 가 바인드한 액션 전량, 앞으로 추가될 것 포함 (OnPlayerDeath)
-	//   ③ bGameOverActive — OpenPauseMenu 조기 반환(이중화)
-	//   ②가 없던 시절엔 ③이 OpenPauseMenu 한 곳만 막아, PC 에 액션을 추가하는 사람이 매번 가드를
-	//   기억해야 성립하는 규율 의존형 방어였다(FIND-071).
-	// TeardownMenuState 의 unpause 는 그대로 둔다 — 멈춘 적 없으면 무해한 no-op 이고, 일시정지 메뉴 경로와
-	//   해제 절차를 하나로 유지하는 편이 안전하다.
-
-	// 버튼 조작만 남긴다(마우스 커서 + 클릭).
-	FInputModeUIOnly InputMode;
-	InputMode.SetWidgetToFocus(GameOverWidget->TakeWidget());
-	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-	SetInputMode(InputMode);
-	bShowMouseCursor = true;
 }
 
 void AVBPlayerController::ContinueFromLastSave()

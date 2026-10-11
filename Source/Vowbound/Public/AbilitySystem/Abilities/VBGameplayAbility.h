@@ -7,6 +7,7 @@
 #include "AbilitySystem/Abilities/VBAbilityActivationPolicy.h"
 #include "VBGameplayAbility.generated.h"
 
+class ACharacter;
 class UVBAbilitySystemComponent;
 
 /**
@@ -55,6 +56,9 @@ protected:
 	// 기본 인자를 두지 않는다. 값의 홈은 UVBAttackConfig 하나여야 하는데, 기본 인자는
 	//   "config 없이도 호출 가능"을 뜻해 두 번째 홈이 된다. 인자 없이 부르면 컴파일이 실패해야 옳다.
 	void PlayHitStop(float RealDuration, float TimeDilation);
+	// 전투원 한정 히트스톱(2026-09-05): 맞은 액터들을 큐의 EffectContext 에, 범위·피격자 추가시간의 홈인 공격 설정을 SourceObject 에 싣는다.
+	//   VBGC_HitStop 이 그것으로 «공격자 + 피격자만» 멈출지 전역으로 멈출지 가른다.
+	void PlayHitStop(float RealDuration, float TimeDilation, const TArray<AActor*>& Victims, const UObject* AttackConfig);
 	
 	// 이 Ability 에서 재생할 AnimMontage (BP에서 설정)
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Animation")

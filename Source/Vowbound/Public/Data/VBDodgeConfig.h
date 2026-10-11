@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "Character/VBWeaponStateTypes.h" // EVBWeaponType (WeaponDodgeSets 키)
+#include "Types/VBWeaponStateTypes.h" // EVBWeaponType (WeaponDodgeSets 키)
 #include "VBDodgeConfig.generated.h"
 
 class UAnimMontage;
@@ -61,6 +61,17 @@ class VOWBOUND_API UVBDodgeConfig : public UPrimaryDataAsset
 public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vowbound|Combat")
 	float DodgeDuration = 0.4f; // 무적시간
+
+	// === 회피 중 공격 (2026-09-05, .sw/combat-feel/design.md §7) ===
+	// 회피 시작부터 이 시각(초)까지는 공격이 롤을 끊지 못한다(State.Combat.DodgeCommit). 0 = 종전대로 언제든 끊김.
+	// 기본 0.45 = 무적(0.4) 직후. 롤 클립은 0.67~1.2초라 그 뒤는 공격이 자른다 - 참고작(스파이더맨·베요네타)의 «회피 캔슬» 과 같은 절충.
+	// 값을 올리면 롤이 더 보이고, 조작 반응은 그만큼 늦어진다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vowbound|Combat", meta=(ClampMin="0.0", ClampMax="2.0"))
+	float AttackCancelSeconds = 0.45f;
+
+	// 커밋 중 눌린 공격을 기억했다가 커밋이 풀리는 순간 내보내는 유예(초). 너무 오래된 입력은 버린다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vowbound|Combat", meta=(ClampMin="0.0", ClampMax="2.0"))
+	float AttackBufferSeconds = 0.5f;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vowbound|Combat")
 	float DodgeStrength = 1200.0f; // LaunchCharacter 속도
 	// 회피 시 상방 부스트 — LaunchCharacter 속도에 합성(전방*DodgeStrength + 이 값)

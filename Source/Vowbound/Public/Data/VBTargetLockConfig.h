@@ -51,7 +51,7 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
 	float MaxCameraPitch = 15.0f;
 
-	// 락온 중 수동 look 입력 감쇠 계수(0=완전차단, 1=일반과 동일). 과거 cpp 0.1f 하드코딩 외부화.
+	// 이전 자산 호환용. 현재 회전은 입력 오프셋 합성을 쓰며 이 값은 소비하지 않는다.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
 	float LockOnLookDampingFactor = 0.1f;
 
@@ -62,10 +62,30 @@ public:
 	// ── 락온 동작(자동) ──
 	// 근접 공격 명중 시 그 적으로 자동 락온 개시 여부.
 	// 무엇: PerformAttackTrace 히트 직후 첫 유효 살아있는 타겟으로 락 시도.
-	// 왜: 때리는 대상엔 락이 걸려 있어야 자연스럽다(전투 감각) + 콤보 후속 스윙 모션워프 자동 급전.
+	// 기본은 자유 시점. 공격 보정은 소프트 런지 경로가 담당한다.
 	// 부작용: 이미 수동 락온 중이면 무시(카메라 뺏지 않음). 스윙당 최대 1회.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
-	bool bAutoLockOnHit = true;
+	bool bAutoLockOnHit = false;
+
+	// 지속 락온과 독립: 실제 근접 피해 후 잠깐만 정렬한다. 값은 플레이로 조정할 초기값.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Camera|HitRecenter")
+	bool bRecenterCameraOnHit = true;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.01"))
+	float HitRecenterDuration = 0.25f;
+	// 마지막 명중 뒤 이만큼 쉬어야 새 보정을 허용한다. 연타로 보정이 계속 재시작되지 않는다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.0"))
+	float HitRecenterQuietSeconds = 0.8f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.0"))
+	float HitRecenterInputGraceSeconds = 0.35f;
+	// 화면 중앙에서의 정규화 반폭/반높이. 이 안에 보이면 카메라를 움직이지 않는다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter")
+	FVector2D HitRecenterSafeHalfExtent = FVector2D(0.25, 0.30);
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.0", ClampMax="180.0"))
+	float HitRecenterMaxYaw = 35.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.0", ClampMax="90.0"))
+	float HitRecenterMaxPitch = 12.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera|HitRecenter", meta=(ClampMin="0.0"))
+	float HitRecenterMaxNotificationAge = 0.35f;
 
 	// bAutoLockOnGuard 와 bAutoLockOnParry 는 2026-08-09 에 여기서 나갔다.
 	//   가드 -> UVBGA_Guard (그 GA 가 유일 소비처)
@@ -88,11 +108,11 @@ public:
 	float SoftLungeAngle = 45.0f;
 
 	// ── 타겟 전환 입력(락온 중 좌우 스위치) ── (VBCharacter 에서 이동 — 논리상 락온 튜닝)
-	// 이 값보다 큰 마우스 X 이동에서만 좌/우 타겟 전환 트리거. 현행 1.5f 보존.
+	// 이전 자산 호환용. 마우스 이동 전환은 폐기되었고 휠 펄스를 사용한다.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
 	float SwitchTargetMouseThreshold = 1.5f;
 
-	// 타겟 전환 후 쿨다운(초) — 연타 방지. 현행 0.3f 보존.
+	// 이전 자산 호환용. 패드는 중립 복귀 래치, 요청 중에는 서버 응답으로 연쇄 전환을 막는다.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
 	float SwitchTargetCooldown = 0.3f;
 
@@ -100,6 +120,38 @@ public:
 	// 왜: FindBestTarget/FindSideTarget/FindSoftLungeTarget 3곳 하드코딩 ECC_Pawn 외부화. 현행 보존.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|LockOn")
 	TEnumAsByte<ECollisionChannel> SearchTraceChannel = ECC_Pawn;
+
+	// 화면 좌표는 로컬 viewport에 대해 0..1로 정규화한다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0"))
+	float ScreenVerticalWeight = 1.5f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0", ClampMax="1.0"))
+	float MinSwitchHorizontalDelta = 0.015f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0", ClampMax="1.0"))
+	float StickSwitchPressThreshold = 0.65f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0", ClampMax="0.99"))
+	float StickSwitchReleaseThreshold = 0.25f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn")
+	bool bAutoRetargetOnDeath = true;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0"))
+	float ManualUnlockHitDelay = 0.75f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn")
+	TEnumAsByte<ECollisionChannel> VisibilityTraceChannel = ECC_Visibility;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.01"))
+	float VisibilityCheckInterval = 0.1f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|LockOn", meta=(ClampMin="0.0"))
+	float OcclusionGraceSeconds = 0.5f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float MaxLookYawOffset = 20.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float MaxLookPitchOffset = 10.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float LookOffsetReturnDelay = 0.6f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float LookOffsetReturnSpeed = 5.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float TrackingDeadZoneDegrees = 0.5f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Camera", meta=(ClampMin="0.0"))
+	float MaxTrackingDegreesPerSecond = 180.0f;
 
 	// ── 전투 카메라 프레이밍(락온 진입 시 전환 목표값) ──
 	// 전환 소요 시간(초) — Timeline 길이

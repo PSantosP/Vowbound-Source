@@ -7,6 +7,8 @@
 #include "CoreLoop/VBMatchState.h"
 #include "VBGameState.generated.h"
 
+class UVBStoryStateComponent;
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVBOnMatchPhaseChanged, EVBMatchPhase, NewPhase, EVBMatchPhase, OldPhase);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVBOnRemainingTimeChanged, int32, NewTimeSec, int32, OldTimeSec);
 
@@ -47,4 +49,8 @@ protected:
 	
 	UFUNCTION()
 	void OnRep_RemainingTimeSec(int32 OldTimeSec);
+
+	// 세계 사실·카운터의 주인(설계 .sw/narrative 2.1절). 읽기는 UVBStoryStateComponent::Get(월드 문맥) - 이 클래스를 몰라도 된다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Story")
+	TObjectPtr<UVBStoryStateComponent> StoryState;
 };

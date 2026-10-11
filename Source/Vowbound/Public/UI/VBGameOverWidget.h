@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/VBScreenWidget.h"
 #include "VBGameOverWidget.generated.h"
 
 class AVBPlayerController;
@@ -19,11 +19,13 @@ class AVBPlayerController;
  *       "계속하기"는 로드 결과와 무관하게 OpenLevel 로 수렴하므로 전적으로 PC 소관이다.
  */
 UCLASS()
-class VOWBOUND_API UVBGameOverWidget : public UUserWidget
+class VOWBOUND_API UVBGameOverWidget : public UVBScreenWidget
 {
 	GENERATED_BODY()
 
 public:
+	UVBGameOverWidget(const FObjectInitializer& ObjectInitializer);
+
 	// 계속하기 — 마지막 세이브를 로드해 레벨 재진입. 세이브가 없으면 PC 가 현재 레벨 재시작으로 폴백한다
 	// (조용한 no-op 금지). 소유 PC 로 위임.
 	UFUNCTION(BlueprintCallable, Category="Vowbound|UI")
@@ -34,9 +36,14 @@ public:
 	void QuitToMenu();
 
 protected:
-	// 위젯이 붙는 순간 버튼을 감췄다가 지연 후 드러낸다. "GAME OVER" 문구를 먼저 읽히게 하려는 연출이고,
-	// 죽자마자 뜬 버튼을 오조작으로 눌러버리는 것도 함께 막는다.
-	virtual void NativeConstruct() override;
+	// 화면이 켜지는 순간 버튼을 감췄다가 지연 후 드러낸다. "GAME OVER" 문구를 먼저 읽히게 하려는 연출이고,
+	// 죽자마자 뜬 버튼을 오조작으로 눌러버리는 것도 함께 막는다. 켜질 때 하는 이유: 화면 위젯은 재사용된다.
+	virtual void NativeOnActivated() override;
+	virtual void NativeOnDeactivated() override;
+
+	// 뒤로 가기를 먹기만 한다. 게임오버 화면은 두 버튼 말고는 나갈 길이 없어야 한다 -
+	//   부모 구현에 맡기면 Esc 한 번에 화면이 닫히고 시체만 남는다.
+	virtual bool NativeOnHandleBackAction() override { return true; }
 
 	// 소유 PlayerController 를 VB 타입으로 캐스트. 실패 시 nullptr(호출부가 방어).
 	AVBPlayerController* GetVBOwningController() const;

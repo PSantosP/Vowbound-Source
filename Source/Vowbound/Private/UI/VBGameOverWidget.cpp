@@ -30,9 +30,30 @@ AVBPlayerController* UVBGameOverWidget::GetVBOwningController() const
 	return Cast<AVBPlayerController>(GetOwningPlayer());
 }
 
-void UVBGameOverWidget::NativeConstruct()
+UVBGameOverWidget::UVBGameOverWidget(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
 {
-	Super::NativeConstruct();
+	// 게임을 멈추지 않는다(2026-07-28 user 결정: "타임 안멈춰도 돼 그냥 진행해도돼"). 입력은 메뉴만.
+	//   게임 입력 차단은 정지가 아니라 Menu 입력 모드가 한다 - 폰·PC 의 DisableInput 은 그대로 남는다(AVBPlayerController::OnPlayerDeath).
+	InputMode = EVBScreenInputMode::Menu;
+	bPausesGame = false;
+	bIsBackHandler = true;
+	// 버튼 이름은 BindWidget 계약이라 여기 적어도 자산과 어긋나지 않는다.
+	DefaultFocusWidgetName = TEXT("BtnContinue");
+}
+
+void UVBGameOverWidget::NativeOnDeactivated()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ButtonRevealTimerHandle);
+	}
+	Super::NativeOnDeactivated();
+}
+
+void UVBGameOverWidget::NativeOnActivated()
+{
+	Super::NativeOnActivated();
 
 	// 버튼을 먼저 감춘다. Collapsed 가 아니라 Hidden 인 이유: Collapsed 는 레이아웃에서 빠져 문구가
 	// 위로 밀렸다가 버튼이 나타날 때 다시 내려앉는다. Hidden 은 자리를 유지해 화면이 흔들리지 않는다.
@@ -74,4 +95,6 @@ void UVBGameOverWidget::RevealButtons()
 	{
 		BtnQuit->SetVisibility(ESlateVisibility::Visible);
 	}
+	// 켜질 때는 버튼이 감춰져 있어 초점을 못 줬다. 드러난 지금 다시 준다 - 안 하면 게임패드로 아무것도 못 누른다.
+	RequestRefreshFocus();
 }

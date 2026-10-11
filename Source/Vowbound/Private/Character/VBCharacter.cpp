@@ -2,6 +2,12 @@
 
 
 #include "Character/VBCharacter.h"
+#include "CharacterCommon/VBRagdollComponent.h"
+#include "Character/VBPlayerRagdollComponent.h"
+#include "Character/VBSlideMovementComponent.h"
+#include "Animation/VBLookAtPOIComponent.h"
+#include "Animation/VBPlayerAttentionComponent.h"
+#include "Components/PostProcessComponent.h"  // 처형 준비 외곽선을 화면에 건다
 
 #include "AbilitySystemBlueprintLibrary.h"
 #include "AbilitySystem/VBAbilitySystemComponent.h"
@@ -11,11 +17,17 @@
 #include "Player/VBPlayerState.h"
 #include "Player/VBPlayerController.h"                     // 사망 연출(슬로모/게임오버) 위임 대상
 #include "Components/CapsuleComponent.h"                   // 사망 시 캡슐 콜리전 해제
+#include "ContextualAnimSceneActorComponent.h"              // 처형 장면 참가 자리 — 생성자에서 만든다
 
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "AbilitySystem/Abilities/VBGameplayAbility.h"
+#include "AbilitySystem/Abilities/VBGA_Crouch.h"   // 자세 관문 묶음(GetPostureBlockingTags)
+#include "Interaction/VBGA_Interact.h"
 #include "Camera/CameraComponent.h"
+#include "GameFramework/GameplayCameraComponent.h"
+#include "Camera/VBEnvironmentCameraComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "Character/VBTargetLockComponent.h"
 #include "Data/VBTargetLockConfig.h"
 #include "Data/VBMovementConfig.h"
@@ -33,11 +45,18 @@
 
 #include "MotionWarpingComponent.h"
 #include "Animation/VBAnimInstance.h"
+#include "PoseSearch/PoseSearchDatabase.h" // 진단 로그가 선택된 MM 풀 이름을 찍는다 - GetName() 에 완전 타입 필요
 #include "Character/VBCharacterTrajectoryComponent.h"
 #include "Character/VBWeaponStateComponent.h"
+#include "Character/VBMeleeTraceComponent.h"
+#include "Character/VBContextEffectComponent.h"
+#include "Character/VBFinisherComponent.h"
 #include "SaveSystem/VBPlayerRestoreComponent.h"
+#include "Player/VBPlayerReadinessComponent.h"
 #include "SaveSystem/VBSaveGameSubsystem.h"                 // 카메라 감도/Y반전 설정 읽기(HandleLook)
 #include "Traversal/VBTraversalComponent.h"
+#include "Interaction/VBInteractorComponent.h"
+#include "Interaction/VBGASPSmartObjectComponent.h"
 #include "Curves/CurveFloat.h"
 // PlayAnimation(UAnimationAsset*) 에 UAnimSequence* 를 넘기려면 완전 타입이 필요하다(사망 애니).
 #include "Animation/AnimSequence.h"
@@ -48,7 +67,7 @@
 
 
 AVBCharacter::AVBCharacter(const FObjectInitializer& ObjectInitializer)
-	: Super(ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UVBSlideMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
 	// GASP RotationRate 토글 (Grounded/Falling) 을 위해 Tick 활성.
 	// 그 외 로직은 여전히 이벤트 기반 — Tick 내부는 movement mode 감지 + CMC RotationRate 설정만 수행.
@@ -96,6 +115,18 @@ AVBCharacter::AVBCharacter(const FObjectInitializer& ObjectInitializer)
 	CameraComponent->SetupAttachment(SpringArmComponent, USpringArmComponent::SocketName);
 	CameraComponent->FieldOfView = CamDefaults->FieldOfView;
 
+	GameplayCameraComponent = CreateDefaultSubobject<UGameplayCameraComponent>(TEXT("GameplayCamera"));
+	// GASP rigs add their own standing height above the mesh origin (feet).
+	GameplayCameraComponent->SetupAttachment(GetMesh());
+	GameplayCameraComponent->SetAutoActivate(false);
+	GameplayCameraComponent->DefaultPlayer = EAutoReceiveInput::Disabled;
+	EnvironmentCameraComponent = CreateDefaultSubobject<UVBEnvironmentCameraComponent>(TEXT("EnvironmentCamera"));
+	RagdollComponent = CreateDefaultSubobject<UVBRagdollComponent>(TEXT("RagdollComponent"));
+	PlayerRagdollComponent = CreateDefaultSubobject<UVBPlayerRagdollComponent>(TEXT("PlayerRagdollComponent"));
+	ContextEffectComponent = CreateDefaultSubobject<UVBContextEffectComponent>(TEXT("ContextEffectComponent"));
+	LookAtPOI = CreateDefaultSubobject<UVBLookAtPOIComponent>(TEXT("LookAtPOI"));
+	PlayerAttention = CreateDefaultSubobject<UVBPlayerAttentionComponent>(TEXT("PlayerAttention"));
+
 	// 캐릭터가 카메라 방향으로 즉시 회전하지 않게
 	// 이동 방향으로 회전하게 설정
 	bUseControllerRotationPitch = false;
@@ -113,6 +144,18 @@ AVBCharacter::AVBCharacter(const FObjectInitializer& ObjectInitializer)
 	
 	// WeaponState 생성
 	WeaponStateComponent = CreateDefaultSubobject<UVBWeaponStateComponent>(TEXT("WeaponStateComponent"));
+	MeleeTraceComponent = CreateDefaultSubobject<UVBMeleeTraceComponent>(TEXT("MeleeTraceComponent"));
+	FinisherComponent = CreateDefaultSubobject<UVBFinisherComponent>(TEXT("FinisherComponent"));
+	// 플러그인이 두 액터를 묶을 때 공격자에도 이것이 있어야 한다. 시작 순간에 붙이지 않는 이유는
+	// AVBEnemyBase::FinisherSceneComponent 주석에 있다(원격 클라 도착 순서).
+	FinisherSceneComponent =
+		CreateDefaultSubobject<UContextualAnimSceneActorComponent>(TEXT("FinisherSceneComponent"));
+
+	// 화면 후처리. 무한 범위라 플레이어가 어디 있든 자기 화면에 걸린다.
+	//   레벨 볼륨에 두면 레벨마다 다시 깔아야 하고 빠뜨리면 그 레벨에서만 조용히 안 나온다.
+	PostProcessComponent = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcessComponent"));
+	PostProcessComponent->SetupAttachment(RootComponent);
+	PostProcessComponent->bUnbound = true;
 	
 	// MotionTrajectory 생성
 	TrajectoryComponent = CreateDefaultSubobject<UVBCharacterTrajectoryComponent>(TEXT("TrajectoryComponent"));
@@ -122,11 +165,24 @@ AVBCharacter::AVBCharacter(const FObjectInitializer& ObjectInitializer)
 
 	// 세이브 위치 복원(WP 스트리밍-안전). 평소 무동작 — GameMode 가 Continue 로드 시에만 BeginRestore 호출.
 	PlayerRestoreComponent = CreateDefaultSubobject<UVBPlayerRestoreComponent>(TEXT("PlayerRestoreComponent"));
+
+	InteractorComponent = CreateDefaultSubobject<UVBInteractorComponent>(TEXT("InteractorComponent"));
+	SmartObjectInteraction = CreateDefaultSubobject<UVBGASPSmartObjectComponent>(TEXT("SmartObjectInteraction"));
 }
 
 void AVBCharacter::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
+	if (IsValid(NewController) && NewController->IsPlayerController() && !PlayerReadinessComponent)
+	{
+		PlayerReadinessComponent = FindComponentByClass<UVBPlayerReadinessComponent>();
+		if (!PlayerReadinessComponent)
+		{
+			PlayerReadinessComponent = NewObject<UVBPlayerReadinessComponent>(this, NAME_None, RF_Transient);
+			AddInstanceComponent(PlayerReadinessComponent);
+			PlayerReadinessComponent->RegisterComponent();
+		}
+	}
 
 	// 서버: PlayerState의 ASC를 가져와서 ActorInfo 초기화
 	if (AVBPlayerState* PS = GetPlayerState<AVBPlayerState>())
@@ -135,6 +191,8 @@ void AVBCharacter::PossessedBy(AController* NewController)
 		if (CachedASC.IsValid())
 		{
 			CachedASC->InitAbilityActorInfo(PS, this);
+			if (SmartObjectInteraction) SmartObjectInteraction->RefreshAbilityState();
+			if (PlayerRagdollComponent) PlayerRagdollComponent->RefreshAbilityState();
 
 			// 서버에서 기본 Ability 부여
 			if (HasAuthority())
@@ -288,6 +346,11 @@ UAnimMontage* AVBCharacter::ResolveDeathMontage() const
 
 void AVBCharacter::HandleDeathCosmetic()
 {
+	if (UVBSlideMovementComponent* SlideCMC = Cast<UVBSlideMovementComponent>(GetCharacterMovement()))
+		SlideCMC->CancelSlide();
+	if (SmartObjectInteraction) SmartObjectInteraction->AbortInteraction();
+	if (PlayerRagdollComponent) PlayerRagdollComponent->CancelRagdoll();
+	SetWantsToAim(false);
 	// 1. 시체가 폰끼리 밀고 밀리지 않게 한다. 단 월드 콜리전은 남긴다.
 	// SetCollisionEnabled(NoCollision) 을 쓰지 말 것. 그건 래그돌 시절 유산이다(적은 래그돌 메쉬가 물리를
 	//   넘겨받아 캡슐이 필요 없었다). 애니메이션 사망에서는 캡슐이 시체를 떠받치는 유일한 지지대라,
@@ -408,6 +471,21 @@ void AVBCharacter::HandleDeathCosmetic()
 
 void AVBCharacter::BeginPlay()
 {
+	// 외곽선 머티리얼을 화면에 건다. 자산이 비면 조용히 넘어가는 것이 아니라 말한다 -
+	//   「외곽선이 안 나온다」의 원인이 여기인지 스텐실 쪽인지 가려야 하기 때문이다.
+	if (PostProcessComponent)
+	{
+		if (FinisherOutlineMaterial)
+		{
+			PostProcessComponent->AddOrUpdateBlendable(FinisherOutlineMaterial, 1.0f);
+		}
+		else
+		{
+			VB_LOG(Log, "%s: FinisherOutlineMaterial 미할당 - 처형 준비 외곽선이 안 나온다 "
+			            "(BP 기본값에서 M_VB_FinisherOutline3 계열을 지정해라)", *GetName());
+		}
+	}
+
 	Super::BeginPlay();
 
 	// 팀이 None 이면 적 AI 에게 투명해진다(지각이 중립을 안 본다) - 증상은 'AI 가 안 쫓아온다' 하나뿐이라
@@ -493,7 +571,7 @@ void AVBCharacter::OpenRiposteWindow(float Duration, AActor* Attacker)
 	// GetParryConfig() 는 미할당 시 CDO 를 돌려주므로 null 폴백을 두지 않는다.
 	if (GetParryConfig()->bAutoLockOnParry && TargetLockComponent)
 	{
-		TargetLockComponent->TryAutoLockOnTarget(Attacker);
+		TargetLockComponent->TryAutoLockOnParryTarget(Attacker);
 	}
 
 	GetWorldTimerManager().SetTimer(
@@ -698,6 +776,11 @@ void AVBCharacter::PlayGuardAccept()
 void AVBCharacter::PostInitializeComponents()
 {
 	Super::PostInitializeComponents();
+	// Existing Blueprint templates may still serialize the old capsule attachment.
+	if (GameplayCameraComponent && GetMesh() && GameplayCameraComponent->GetAttachParent() != GetMesh())
+	{
+		GameplayCameraComponent->AttachToComponent(GetMesh(), FAttachmentTransformRules::KeepRelativeTransform);
+	}
 
 	// BeginPlay 가 아니라 여기여야 한다. AVBCharacter::BeginPlay 는 Super::BeginPlay() 로 컴포넌트를 먼저 시작시키는데,
 	// VBTargetLockComponent::BeginPlay 가 그 시점에 SpringArm/Camera 의 "평상시 값"을 캡처해 전투 카메라 Lerp 의
@@ -745,6 +828,16 @@ void AVBCharacter::ApplyMovementConfigToCMC()
 	CMC->AirControl                 = Cfg->AirControl;
 	CMC->MaxWalkSpeedCrouched       = Cfg->NormalCrouchMaxWalkSpeed; // tick 이 무장 시 프로파일 CrouchSpeed 로 덮음
 	CMC->RotationRate               = Cfg->DefaultRotationRate;      // tick 이 매 프레임 갱신(baseline 만 확정)
+	if (UVBSlideMovementComponent* SlideCMC = Cast<UVBSlideMovementComponent>(CMC))
+	{
+		SlideCMC->SlideStartSpeed = Cfg->SlideStartSpeed;
+		SlideCMC->SlideEndSpeed = Cfg->SlideEndSpeed;
+		SlideCMC->SlideMaxDuration = Cfg->SlideMaxDuration;
+		SlideCMC->SlideSettings = Cfg->SlideSettings;
+		SlideCMC->SlideMaxSpeed = Cfg->SlideMaxSpeed;
+		VB_CLOG(Cfg->SlideEndSpeed >= Cfg->SlideStartSpeed, Warning,
+			"이동 설정 %s: SlideEndSpeed(%.0f) >= SlideStartSpeed(%.0f) - 슬라이드를 시작하지 않는다", *GetNameSafe(Cfg), Cfg->SlideEndSpeed, Cfg->SlideStartSpeed);
+	}
 
 	// bAllowPhysicsRotationDuringAnimRootMotion 은 여기서 세우지 않는다 — 워프 타겟 유무에 따라
 	// 매 프레임 갈리므로 Tick 이 단독으로 소유한다(근거는 그쪽 주석).
@@ -761,6 +854,13 @@ bool AVBCharacter::IsWarpOwningRotation() const
 
 bool AVBCharacter::IsCapsuleRotationOwnedByFeature() const
 {
+	// Paired montage alignment owns facing through the whole interaction, including
+	// the section after its short warp window. Camera-facing rotation would undo it.
+	if (UVBFinisherComponent::IsActorInScene(this)) return true;
+	if (PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive()) return true;
+	if (SmartObjectInteraction && SmartObjectInteraction->OwnsCapsuleFacing()) return true;
+	// 환경 상호작용의 설 자리 이동은 루트모션 소스다. 그 사이 PhysicsRotation 이 돌면 소품을 등진다.
+	if (InteractorComponent && InteractorComponent->OwnsCapsuleFacing()) return true;
 	// 워프: SkewWarp 의 Facing 이 캐릭터를 적 쪽으로 돌리는데 PhysicsRotation 은 컨트롤 회전(카메라) 쪽으로
 	//   돌린다. 둘 다 켜면 주도권이 갈린다. 근접에서는 두 방향이 거의 같아 안 드러나지만, 멀리서 돌진하면
 	//   차이가 커져 회전이 눈에 띄게 어긋난다(2026-08-03 user FEEL). 도는 동안은 워프가 유일한 주인이어야 한다.
@@ -831,13 +931,72 @@ void AVBCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	// GASP 기법 — Grounded(-1, instant) / Falling(500, smooth) 토글.
-	// MovementMode 변경 event 훅이 Character 에는 없고 CMC 상태를 매 tick 읽는 게 안전하다.
+	// CMC PhysicsRotation 직전에도 같은 정책을 갱신한다. 회전이 보류된 프레임의 상태도 여기서 유지한다.
 	UpdateRotationRateForMovementMode();
 
 	// 방향(Forward/Strafe/Backward) + Gait/Sprint/Armed 조합으로 MaxWalkSpeed 갱신.
 	// 매 tick 호출 — velocity 방향이 매 frame 변할 수 있어 단발적 setter 로는 부족.
 	UpdateMaxSpeed();
+	if ((PendingSlideJumpUntil > 0.f || bSlideJumpAwaitingMovement) && !IsSlideJumpSceneAllowed())
+	{
+		PendingSlideJumpUntil = 0.f;
+		bSlideJumpAwaitingMovement = false;
+		bSlideJumpReleaseRequested = false;
+		bJumpInputHeld = false;
+		StopJumping();
+	}
+	if (bSlideJumpAwaitingMovement && (bWasJumping || !bPressedJump
+		|| !GetCharacterMovement() || !GetCharacterMovement()->IsMovingOnGround()))
+	{
+		bSlideJumpAwaitingMovement = false;
+		if (bSlideJumpReleaseRequested && !bJumpInputHeld) StopJumping();
+		bSlideJumpReleaseRequested = false;
+	}
+	if (PendingSlideJumpUntil > 0.f)
+	{
+		const UCharacterMovementComponent* JumpCMC = GetCharacterMovement();
+		if (GetWorld()->GetTimeSeconds() >= PendingSlideJumpUntil || !JumpCMC || !JumpCMC->IsMovingOnGround())
+		{
+			PendingSlideJumpUntil = 0.f;
+			if (bSlideJumpReleaseRequested && !bJumpInputHeld) StopJumping();
+			bSlideJumpReleaseRequested = false;
+		}
+		else if (!bIsCrouched)
+		{
+			PendingSlideJumpUntil = 0.f;
+			bSlideJumpAwaitingMovement = true;
+			Jump();
+		}
+	}
+
+	// 공격 캔슬로 버린 이동이 되살아나지 않게 누른다(StopResidualAttackMotion 이 마감 시각을 세운다).
+	// 이동 입력이 들어오면 즉시 그만둔다 - 그 순간부터는 플레이어가 원하는 이동이다.
+	if (ResidualMotionSuppressUntil > 0.0)
+	{
+		UCharacterMovementComponent* SuppressCMC = GetCharacterMovement();
+		const FAnimMontageInstance* RootMotionOwner = GetRootMotionAnimMontageInstance();
+		UAnimInstance* Anim = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+		const FAnimMontageInstance* RecoveryInstance = Anim ? Anim->GetMontageInstanceForID(ResidualMotionMontageInstanceId) : nullptr;
+		const bool bOwnerChanged = RootMotionOwner && RootMotionOwner->GetInstanceID() != ResidualMotionMontageInstanceId;
+		const bool bDone = !SuppressCMC
+			|| !RecoveryInstance || bOwnerChanged || !SuppressCMC->IsMovingOnGround() || SuppressCMC->HasRootMotionSources()
+			|| GetWorld()->GetTimeSeconds() >= ResidualMotionSuppressUntil
+			|| SuppressCMC->GetCurrentAcceleration().Size2D() > KINDA_SMALL_NUMBER;
+		if (bDone)
+		{
+			ResidualMotionSuppressUntil = 0.0;
+			ResidualMotionMontageInstanceId = INDEX_NONE;
+			// 새 몽타주의 Task 가 설정한 배율은 이전 공격의 정리 대상이 아니다.
+			if (!bOwnerChanged && GetAnimRootMotionTranslationScale() == 0.0f)
+				SetAnimRootMotionTranslationScale(1.0f);
+		}
+		else
+		{
+			SetAnimRootMotionTranslationScale(0.0f);
+			SuppressCMC->Velocity.X = 0.0f;
+			SuppressCMC->Velocity.Y = 0.0f;
+		}
+	}
 
 	// 순서가 계약이다 - 정리를 먼저 돌려야 IsWarpOwningRotation 이 "남아 있는 타겟"만 보고 판정한다.
 	UpdateWarpTargetLifetime();
@@ -900,22 +1059,31 @@ void AVBCharacter::UpdateRotationRateForMovementMode()
 	UCharacterMovementComponent* CMC = GetCharacterMovement();
 	if (!CMC) return;
 
-	// GASP 핵심: 지면에서는 RotationRate=-1 (즉시 snap) → Actor 가 "target rotation" 으로 기능.
-	//          공중에서는 (0,500,0) 로 부드럽게 — 공중 snap 은 부자연스럽기 때문.
-	// 무기On 지상의 회전율. 기준은 IsInCombat 이다 (DEC-007 ⑤ 상태2 경계, 2026-06-10).
-	// 무기On 지상은 «유한 속도» 여야 한다 (2026-08-29 저녁, 조건부 잠금과 한 쌍).
-	//   같은 날 오전에 즉시(-1)로 바꿨다가 되돌렸다. 즉시면 캡슐이 카메라를 그 프레임에 따라잡아
-	//   «아직 안 돈 각» 이 영영 안 쌓이고, 그러면 아래의 조건부 잠금이 발화할 일이 없어 회전 애니가
-	//   아예 안 나온다. 값이 클수록 몸이 카메라를 잘 따라가고 회전 애니는 드물게 난다 - 그 저울의
-	//   눈금이 이 값이다. 값의 홈은 이 주석이 아니라 `DA_Movement_Default` 다 - 숫자를 여기 안 적는다.
-	//   FEEL 통과 확인됨. 값의 홈은 이 주석이 아니라 그 데이터 자산이다 - 여기서 숫자를 단정하지 않는다.
+	// 무입력/legacy 무장은 유한 회전율로 제자리 회전의 남은 각을 보존한다.
+	// GASP 이동 중에는 캡슐을 목표 방향으로 쓰고 OffsetRootBone/Steering이 화면 회전을 만든다.
+	// 캡슐까지 늦게 돌리면 카메라 기준 W 가속과 궤적 facing이 벌어져 옆 이동으로 질의된다.
 	const bool bArmedGrounded = !CMC->IsFalling()
 		&& WeaponStateComponent
 		&& WeaponStateComponent->IsInCombat();
+	const FVector InputAcceleration = CMC->GetCurrentAcceleration();
+	const bool bWantsToMove = !InputAcceleration.IsNearlyZero();
+	const UVBAnimInstance* VBAnim = Cast<UVBAnimInstance>(GetMesh() ? GetMesh()->GetAnimInstance() : nullptr);
+	const UVBAnimInstance* AnimSettings = VBAnim;
+	if (!AnimSettings && GetMesh() && GetMesh()->GetAnimClass())
+	{
+		// 서버/초기화 경계에서도 같은 AnimClass 설정을 사용한다. 런타임 포즈 상태는 CDO에서 읽지 않는다.
+		AnimSettings = Cast<UVBAnimInstance>(GetMesh()->GetAnimClass()->GetDefaultObject());
+	}
+	const bool bGASPMoving = CMC->IsMovingOnGround()
+		&& !FVector(InputAcceleration.X, InputAcceleration.Y, 0.f).IsNearlyZero()
+		&& AnimSettings && AnimSettings->bUseGASPLocomotion
+		&& !(VBAnim && (VBAnim->IsAnyMontagePlaying() || VBAnim->ShouldReleaseGASPRootOffset()))
+		&& !IsPlayingRootMotion() && !CMC->HasRootMotionSources()
+		&& !IsCapsuleRotationOwnedByFeature();
 	const UVBMovementConfig* Cfg = GetMovementConfig();
 	FRotator Target = CMC->IsFalling()
 		? Cfg->AirborneRotationRate
-		: (bArmedGrounded ? Cfg->ArmedGroundedRotationRate : Cfg->DefaultRotationRate);
+		: (bArmedGrounded && !bGASPMoving ? Cfg->ArmedGroundedRotationRate : Cfg->DefaultRotationRate);
 
 	// ── 제자리 회전이 회전을 소유한 동안 «캡슐을 세워 둔다» (FIND-105, 2026-08-28) ──
 	// 왜: 그 조합의 회전은 루트모션 몽타주가 만든다. 캡슐이 카메라를 계속 따라가 버리면 애니가
@@ -925,10 +1093,9 @@ void AVBCharacter::UpdateRotationRateForMovementMode()
 	// 소유권 판정을 여기서 다시 하지 않는다 - 애님 인스턴스가 답한다(`IsRootMotionTurnActive`).
 	// 같은 판정이 두 곳에 있으면 한쪽이 낡고, 그 순간 «애니는 도는데 캡슐도 도는» 이중 회전이 된다.
 	// 못 내는 요청을 만나 폴백 중이면 그 답이 거짓이 되어 캡슐이 회전을 돌려받는다.
-	const bool bWantsToMove = !CMC->GetCurrentAcceleration().IsNearlyZero();
 	if (!CMC->IsFalling() && !bWantsToMove)
 	{
-		if (const UVBAnimInstance* VBAnim = Cast<UVBAnimInstance>(GetMesh() ? GetMesh()->GetAnimInstance() : nullptr))
+		if (VBAnim)
 		{
 			if (VBAnim->IsRootMotionTurnActive())
 			{
@@ -955,6 +1122,8 @@ void AVBCharacter::OnRep_PlayerState()
 		if (CachedASC.IsValid())
 		{
 			CachedASC->InitAbilityActorInfo(PS, this);
+			if (SmartObjectInteraction) SmartObjectInteraction->RefreshAbilityState();
+			if (PlayerRagdollComponent) PlayerRagdollComponent->RefreshAbilityState();
 		}
 	}
 }
@@ -966,10 +1135,22 @@ void AVBCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 	if (UEnhancedInputComponent* EnhancedInput =
 			Cast<UEnhancedInputComponent>(PlayerInputComponent))
 	{
+		if (RagdollAction)
+			EnhancedInput->BindAction(RagdollAction, ETriggerEvent::Started, this, &AVBCharacter::HandleRagdollPressed);
+		if (AimAction)
+		{
+			EnhancedInput->BindAction(AimAction, ETriggerEvent::Started, this, &AVBCharacter::HandleAimPressed);
+			EnhancedInput->BindAction(AimAction, ETriggerEvent::Completed, this, &AVBCharacter::HandleAimReleased);
+			EnhancedInput->BindAction(AimAction, ETriggerEvent::Canceled, this, &AVBCharacter::HandleAimReleased);
+		}
 		// 이동
 		if (MoveAction)
 		{
 			EnhancedInput->BindAction(MoveAction, ETriggerEvent::Triggered, this, &AVBCharacter::HandleMove);
+			// 뗀 순간과 취소된 순간 둘 다 묶는다. 매달림이 마지막 입력값을 상태로 들고 있어서
+			//   누가 0 을 알려주지 않으면 키를 떼도 계속 옆걸음한다.
+			EnhancedInput->BindAction(MoveAction, ETriggerEvent::Completed, this, &AVBCharacter::HandleMoveCompleted);
+			EnhancedInput->BindAction(MoveAction, ETriggerEvent::Canceled, this, &AVBCharacter::HandleMoveCompleted);
 		}
 
 		// 마우스 룩
@@ -1032,6 +1213,13 @@ void AVBCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 			                          &AVBCharacter::HandleSprintReleased);
 		}
 
+		if (InteractAction)
+		{
+			EnhancedInput->BindAction(InteractAction, ETriggerEvent::Started, this, &AVBCharacter::HandleInteractPressed);
+			EnhancedInput->BindAction(InteractAction, ETriggerEvent::Completed, this,
+			                          &AVBCharacter::HandleInteractReleased);
+		}
+
 		if (WalkToggleAction)
 		{
 			// Walk는 Press-toggle (Sprint는 Hold). Started 한 번에 켜짐/꺼짐 전환.
@@ -1045,8 +1233,9 @@ void AVBCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 
 		if (SwitchTargetAction)
 		{
-			EnhancedInput->BindAction(SwitchTargetAction, ETriggerEvent::Started, this,
-			                          &AVBCharacter::HandleSwitchTarget);
+			EnhancedInput->BindAction(SwitchTargetAction, ETriggerEvent::Triggered, this, &AVBCharacter::HandleSwitchTarget);
+			EnhancedInput->BindAction(SwitchTargetAction, ETriggerEvent::Completed, this, &AVBCharacter::HandleSwitchTargetReleased);
+			EnhancedInput->BindAction(SwitchTargetAction, ETriggerEvent::Canceled, this, &AVBCharacter::HandleSwitchTargetReleased);
 		}
 		
 		if (WeaponSummonAction)
@@ -1092,6 +1281,26 @@ void AVBCharacter::GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& O
 	                               Gait,
 	                               COND_None,
 	                               REPNOTIFY_Always);
+	DOREPLIFETIME(AVBCharacter, bWantsToAim);
+	DOREPLIFETIME(AVBCharacter, bIsSliding);
+	DOREPLIFETIME(AVBCharacter, WantsToStrafe);
+}
+
+void AVBCharacter::OnSlideMovementStateChanged(bool bNewSliding)
+{
+	if (bIsSliding == bNewSliding) return;
+	bIsSliding = bNewSliding;
+	OnRep_Sliding(); // Authority and predicted owner need the same visual transition as remote OnRep.
+}
+
+void AVBCharacter::OnRep_Sliding()
+{
+	if (ActiveSlideMontage)
+	{
+		if (UAnimInstance* Anim = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr)
+			Anim->Montage_Stop(0.2f, ActiveSlideMontage);
+		ActiveSlideMontage = nullptr;
+	}
 }
 
 void AVBCharacter::OnRep_Sprint()
@@ -1104,6 +1313,42 @@ void AVBCharacter::HandleMove(const FInputActionValue& Value)
 {
 	// 카메라 기준으로 이동
 	const FVector2D MoveValue = Value.Get<FVector2D>();
+	if (UVBFinisherComponent::IsActorInScene(this)) return;
+	if (InteractorComponent && InteractorComponent->GetPushable())
+	{
+		InteractorComponent->SetPushInput(MoveValue.Y);
+		return;
+	}
+	// 정렬/접촉 동작 중 입력으로 발이 미끄러지지 않게 한다. 종료 뒤 홀드 중인 입력은 다음 틱에 재개된다.
+	if (InteractorComponent && InteractorComponent->OwnsCapsuleFacing()) return;
+	if (!MoveValue.IsNearlyZero() && SmartObjectInteraction && SmartObjectInteraction->IsInteracting())
+		SmartObjectInteraction->RequestExit();
+	if (PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive())
+	{
+		const FRotator Yaw(0, Controller ? Controller->GetControlRotation().Yaw : GetActorRotation().Yaw, 0);
+		PlayerRagdollComponent->SetRollInput(Yaw.RotateVector(FVector(MoveValue.Y, MoveValue.X, 0)));
+		return;
+	}
+
+	// 매달림 중에는 이동 입력의 주인이 트래버설 컴포넌트다(좌우=옆걸음, 앞=올라서기, 뒤=놓기).
+	//   CMC 에 넘기면 Flying 가속이 붙어 스플라인이 정한 자리에서 밀려난다.
+	if (TraversalComponent && TraversalComponent->IsHanging())
+	{
+		TraversalComponent->SetHangMoveInput(MoveValue);
+		return;
+	}
+	// 등반 중에는 두 축이 그대로 벽 위의 이동이다. X=좌우, Y=위아래.
+	if (TraversalComponent && TraversalComponent->IsClimbing())
+	{
+		TraversalComponent->SetClimbMoveInput(MoveValue);
+		return;
+	}
+	// 사다리는 위아래 하나뿐이다. 좌우는 버린다 - 옆으로 갈 데가 없다.
+	if (TraversalComponent && TraversalComponent->IsOnLadder())
+	{
+		TraversalComponent->SetLadderMoveInput(MoveValue.Y);
+		return;
+	}
 
 	if (Controller)
 	{
@@ -1117,35 +1362,45 @@ void AVBCharacter::HandleMove(const FInputActionValue& Value)
 	}
 }
 
+void AVBCharacter::HandleMoveCompleted()
+{
+	if (InteractorComponent) InteractorComponent->SetPushInput(0.0f);
+	if (PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive())
+	{
+		PlayerRagdollComponent->SetRollInput(FVector::ZeroVector);
+		return;
+	}
+	// 매달림·등반만 영향을 받는다. 지상 이동은 입력이 멈추면 CMC 가 알아서 멎으므로 여기서 할 일이 없다.
+	if (TraversalComponent && TraversalComponent->IsHanging())
+	{
+		TraversalComponent->SetHangMoveInput(FVector2D::ZeroVector);
+	}
+	else if (TraversalComponent && TraversalComponent->IsClimbing())
+	{
+		TraversalComponent->SetClimbMoveInput(FVector2D::ZeroVector);
+	}
+	else if (TraversalComponent && TraversalComponent->IsOnLadder())
+	{
+		TraversalComponent->SetLadderMoveInput(0.0f);
+	}
+}
+
 void AVBCharacter::HandleLook(const FInputActionValue& Value)
 {
 	// 마우스로 카메라 회전
 	const FVector2D LookValue = Value.Get<FVector2D>();
+	if (TargetLockComponent)
+		TargetLockComponent->NotifyManualCameraInput(LookValue.X, LookValue.Y);
 
 	// 감도/Y반전. 홈은 설정 세이브 하나이고 여기서 직접 읽는다(캐시 없음 = 설정 변경 즉시 반영).
 	const FVBSettingsSaveData& Settings = UVBSaveGameSubsystem::GetSettingsData(this);
 	const float LookYaw = LookValue.X * Settings.LookSensitivity;
 	const float LookPitch = LookValue.Y * Settings.LookSensitivity * (Settings.bInvertYAxis ? -1.0f : 1.0f);
 
-	if (TargetLockComponent && TargetLockComponent->IsLockedOn())
+	if (TargetLockComponent && TargetLockComponent->CanTrackCamera())
 	{
-		double Now = FPlatformTime::Seconds();
-
-		// 타겟 전환 임계/쿨다운은 TargetLockConfig 외부화(데이터화 P0). CDO 폴백이라 non-null.
-		// 감도를 곱하지 않은 원본 입력으로 판정한다: 이 임계는 "옆으로 튕겼는가"라는 입력 의도 판정이고
-		// 감도는 회전 속도의 문제다. 곱하면 감도를 낮춘 사용자가 타겟 전환까지 못 하게 된다.
-		const UVBTargetLockConfig* LockCfg = TargetLockComponent->GetTargetLockConfig();
-		if ((Now - LastSwitchTargetTime) > LockCfg->SwitchTargetCooldown &&
-			FMath::Abs(LookValue.X) > LockCfg->SwitchTargetMouseThreshold)
-		{
-			TargetLockComponent->SwitchTarget(LookValue.X);
-			LastSwitchTargetTime = Now;
-		}
-
-		// LockOn 중에는 카메라 수동 제어 감쇠 — 계수는 TargetLockConfig 외부화(과거 0.1f 하드코딩).
-		const float LookDamping = LockCfg->LockOnLookDampingFactor;
-		AddControllerYawInput(LookYaw * LookDamping);	// 좌 우 회전
-		AddControllerPitchInput(LookPitch * LookDamping);	// 상 하 회전
+		// 패드 X는 전환 액션만 소비한다. 마우스는 대상 변경 없이 구도 오프셋만 준다.
+		TargetLockComponent->AddLookInput(LookYaw, LookPitch, InputDeviceManager && InputDeviceManager->IsUsingGamepad());
 		return;
 	}
 
@@ -1155,11 +1410,37 @@ void AVBCharacter::HandleLook(const FInputActionValue& Value)
 
 void AVBCharacter::HandleAbilityInputPressed(FGameplayTag InputTag)
 {
+	// 매달린 동안은 능력 입력을 통째로 막는다. 공격·회피 몽타주가 DefaultSlot 을 타고 매달림 포즈를 덮고,
+	//   루트모션이 스플라인이 정한 자리에서 캡슐을 끌어낸다. 매달림의 입력 셋(옆걸음·올라서기·놓기)은
+	//   HandleMove/HandleJumpPressed/HandleCrouchPressed 가 이 함수 앞에서 가로챈다.
+	if (TraversalComponent && TraversalComponent->IsHanging())
+	{
+		return;
+	}
+	// 등반도 같다. 벽에 붙은 동안 능력 입력을 막지 않으면 몽타주가 자세를 덮고 캡슐을 벽에서 끌어낸다.
+	if (TraversalComponent && TraversalComponent->IsClimbing())
+	{
+		return;
+	}
+
 	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
 	if (!ASC)
 	{
 		return;
 	}
+
+	// 순회하는 동안 목록이 바뀌지 않게 잠근다 (2026-09-23, FIND-087 종결).
+	//
+	// 왜: 이 루프 안의 TryActivateAbility 가 다시 목록을 건드리는 실경로가 있다 -
+	//   경공격 -> EnsureWeaponSummoned -> CancelAbilities 가 그것이다. 그 사이에 스펙 배열이
+	//   재할당되면 지금 들고 있는 참조가 가리키던 자리가 사라진다.
+	//   게다가 이 루프는 활성화에 실패해도 break 하지 않고 다음 후보로 계속 가므로(아래 주석 참조)
+	//   «목록을 바꾼 뒤에도 계속 도는» 시간이 길다 - 노출이 큰 모양이다.
+	// 엔진의 같은 일을 하는 함수들도 이 잠금을 건다. 잠금은 실제 변경을 막는 것이 아니라
+	//   순회가 끝날 때까지 «미뤄» 배열이 그 자리에서 재할당되지 않게 한다.
+	// 매크로(ABILITYLIST_SCOPE_LOCK)를 안 쓰는 이유: 그 매크로는 `*this` 를 넘기므로
+	//   ASC 자신의 멤버 함수 안에서만 성립한다. 여기는 캐릭터라 대상을 명시해야 한다.
+	FScopedAbilityListLock ActiveScopeLock(*ASC);
 
 	// ASC에 등록된 모든 Ability 순회
 	for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
@@ -1177,6 +1458,10 @@ void AVBCharacter::HandleAbilityInputPressed(FGameplayTag InputTag)
 		// 두 능력이 동시에 도는 창이 열린다.
 		if (Spec.IsActive())
 		{
+			if (InputTag == VBGameplayTags::Input_Interact && InteractorComponent)
+			{
+				InteractorComponent->RequestRepeatInteraction();
+			}
 			break;
 		}
 
@@ -1203,6 +1488,11 @@ void AVBCharacter::HandleAbilityInputReleased(FGameplayTag InputTag)
 	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
 	if (!ASC) return;
 
+	// 여기도 잠근다. 지금은 CancelAbilityHandle 직후 무조건 break 라서 잠금 없이도 안전하지만,
+	//   그 안전을 지탱하는 것이 break 한 줄뿐이다 - 누가 그 줄을 지우거나 조건을 달면
+	//   순회 중 목록 변경이 조용히 되살아난다. 두 순회가 같은 규칙을 따르게 둔다.
+	FScopedAbilityListLock ActiveScopeLock(*ASC);
+
 	for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
 	{
 		const UVBGameplayAbility* VBAbility = Cast<UVBGameplayAbility>(Spec.Ability);
@@ -1210,6 +1500,8 @@ void AVBCharacter::HandleAbilityInputReleased(FGameplayTag InputTag)
 
 		if (Spec.IsActive())
 		{
+			const UVBGA_Interact* Interaction = Cast<UVBGA_Interact>(Spec.GetPrimaryInstance());
+			if (Interaction && !Interaction->ShouldCancelOnInputRelease()) break;
 			ASC->CancelAbilityHandle(Spec.Handle);
 		}
 		break;
@@ -1259,9 +1551,79 @@ void AVBCharacter::ServerHandleAttackInput_Implementation()
 	}
 	else
 	{
+		// 회피 커밋 중(design §7): 경공격이 태그로 막혀 있으니 입력을 버리지 않고 저장한다. 커밋이 풀리면 EndDodgeCommit 이 꺼내 내보낸다.
+		if (ASC->HasMatchingGameplayTag(VBGameplayTags::State_Combat_DodgeCommit))
+		{
+			// 안전망(규칙 27): 커밋 타이머가 안 살아 있는데 태그만 남았으면 배선 결함이다. 공격을 영영 못 하게 두지 말고 태그를 걷고 진행하되 소리낸다.
+			if (!GetWorldTimerManager().IsTimerActive(DodgeCommitTimerHandle))
+			{
+				VB_LOG(Warning, "[Combo] DodgeCommit 태그가 타이머 없이 남아 있다 - 걷어내고 공격 진행 (배선 결함)");
+				ASC->SetLooseGameplayTagCount(VBGameplayTags::State_Combat_DodgeCommit, 0);
+			}
+			else
+			{
+				PendingAttackInputTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+				VB_LOG(Log, "[Combo] 회피 커밋 중 공격 입력 - 저장");
+				return;
+			}
+		}
 		// 공격 중 아님 → 새 GA 활성화
 		HandleAbilityInputPressed(VBGameplayTags::Input_Attack_Light);
 	}
+}
+
+void AVBCharacter::BeginDodgeCommit(float CancelSeconds, float BufferSeconds)
+{
+	if (!HasAuthority() || CancelSeconds <= 0.0f) return;
+	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
+	{
+		ASC->SetLooseGameplayTagCount(VBGameplayTags::State_Combat_DodgeCommit, 1);
+	}
+	GetWorldTimerManager().SetTimer(DodgeCommitTimerHandle,
+	                                FTimerDelegate::CreateUObject(this, &AVBCharacter::EndDodgeCommit, BufferSeconds),
+	                                CancelSeconds, false);
+}
+
+void AVBCharacter::EndDodgeCommit(float BufferSeconds)
+{
+	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
+	{
+		ASC->SetLooseGameplayTagCount(VBGameplayTags::State_Combat_DodgeCommit, 0);
+	}
+	// 커밋 중 눌린 공격이 있으면 지금 내보낸다 - 회피 오프셋(VBGA_MeleeAttackBase)이 콤보 자리를 이어 준다.
+	ConsumePendingAttackInput(BufferSeconds);
+}
+
+void AVBCharacter::CancelDodgeCommit()
+{
+	if (!HasAuthority()) return;
+	GetWorldTimerManager().ClearTimer(DodgeCommitTimerHandle);
+	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponent())
+	{
+		ASC->SetLooseGameplayTagCount(VBGameplayTags::State_Combat_DodgeCommit, 0);
+	}
+	ClearPendingAttackInput();
+}
+
+void AVBCharacter::ConsumePendingAttackInput(float BufferSeconds)
+{
+	if (!HasAuthority() || PendingAttackInputTime < 0.0) return;
+	const double Age = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0) - PendingAttackInputTime;
+	PendingAttackInputTime = -1.0;
+	if (Age <= BufferSeconds)
+	{
+		VB_LOG(Log, "[Combo] 회피 커밋 해제 - 저장 입력(나이 %.2f초) 내보냄", Age);
+		HandleAbilityInputPressed(VBGameplayTags::Input_Attack_Light);
+	}
+	else
+	{
+		VB_LOG(Log, "[Combo] 회피 커밋 해제 - 저장 입력 나이 %.2f초 > %.2f, 버림", Age, BufferSeconds);
+	}
+}
+
+void AVBCharacter::ClearPendingAttackInput()
+{
+	PendingAttackInputTime = -1.0;
 }
 
 void AVBCharacter::MulticastJumpToMontageSection_Implementation(UAnimMontage* Montage, FName SectionName)
@@ -1298,10 +1660,62 @@ void AVBCharacter::HandleExecute()
 	HandleAbilityInputPressed(VBGameplayTags::Input_Execute);
 }
 
+bool AVBCharacter::IsSlideJumpSceneAllowed() const
+{
+	return !(InteractorComponent && InteractorComponent->OwnsCapsuleFacing())
+		&& !(SmartObjectInteraction && SmartObjectInteraction->IsInteracting())
+		&& !(PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive())
+		&& !UVBAbilitySystemStatics::IsActorFinishing(this)
+		&& !UVBAbilitySystemStatics::IsActorDead(this)
+		&& !(TraversalComponent && (TraversalComponent->IsDoingTraversal() || TraversalComponent->OwnsCapsuleFacing()));
+}
+
+bool AVBCharacter::CanJumpInternal_Implementation() const
+{
+	return (!bSlideJumpAwaitingMovement || IsSlideJumpSceneAllowed()) && Super::CanJumpInternal_Implementation();
+}
+
 void AVBCharacter::HandleJumpPressed()
 {
+	if (InteractorComponent && InteractorComponent->OwnsCapsuleFacing()) return;
+	if (SmartObjectInteraction && SmartObjectInteraction->IsInteracting()) return;
+	if (PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive())
+	{
+		PlayerRagdollComponent->RequestGetUp();
+		return;
+	}
+	// 처형을 거는 중에는 물러난다. 여기서 몽타주가 나가면 처형 애니가 그 자리에서 끊기고
+	//   플러그인이 그것을 「장면 이탈」로 읽어 장면을 통째로 끝낸다(user 결정: 처형은 안 끊긴다).
+	// GA 인 입력(공격·회피·가드)은 UVBGA_Execute 의 차단 목록이 막는다. 이 경로는 GA 를 안 거쳐
+	//   컴포넌트를 직접 부르므로 여기서 스스로 묻는다 - 질의는 공용 한 곳을 쓴다.
+	if (UVBAbilitySystemStatics::IsActorFinishing(this))
+	{
+		return;
+	}
+	bool bJumpedOutOfSlide = false;
+	if (UVBSlideMovementComponent* SlideCMC = Cast<UVBSlideMovementComponent>(GetCharacterMovement()))
+	{
+		bJumpedOutOfSlide = SlideCMC->IsSliding();
+		SlideCMC->CancelSlide();
+	}
+
+	// 매달린 채 점프 = 올라서기. 홀드 플래그는 세우지 않는다 - 올라선 뒤 Walking 이라 공중 체크와 무관하지만,
+	//   놓기로 이어질 때 쥔 채 남은 플래그가 같은 렛지를 다시 물게 한다(재잡기 유예는 컴포넌트가 따로 건다).
+	if (TraversalComponent && TraversalComponent->IsHanging())
+	{
+		TraversalComponent->RequestHangClimbUp();
+		return;
+	}
+	// 등반 중 점프는 아직 할 일이 없다. 벽차기와 꼭대기 올라서기가 여기 붙을 자리다(단계 2 남은 분).
+	//   그냥 두면 일반 점프가 돌아 벽에서 캡슐이 튀어 나가므로 여기서 끊는다.
+	if (TraversalComponent && TraversalComponent->IsClimbing())
+	{
+		return;
+	}
+
 	// 공중 맨틀 홀드 게이트 — 점프부터 계속 홀드하거나 공중에서 재입력하면 Tick 의 공중 체크가 이어받는다.
 	bJumpInputHeld = true;
+	bSlideJumpReleaseRequested = false;
 
 	// GASP-exact 지상 게이트 (2026-06-04 라이브 검증): GASP IA_Jump 는
 	//   !DoingTraversalAction && CMC.IsMovingOnGround → TryTraversalAction → 실패 시 Jump
@@ -1318,17 +1732,78 @@ void AVBCharacter::HandleJumpPressed()
 	{
 		return;
 	}
+	if (bJumpedOutOfSlide && bIsCrouched)
+	{
+		PendingSlideJumpUntil = GetWorld()->GetTimeSeconds() + 0.25f;
+		return;
+	}
 	Jump();
 }
 
 void AVBCharacter::HandleJumpReleased()
 {
 	bJumpInputHeld = false;
+	if (PendingSlideJumpUntil > 0.f || bSlideJumpAwaitingMovement)
+	{
+		bSlideJumpReleaseRequested = true;
+		return;
+	}
 	StopJumping();
 }
 
 void AVBCharacter::HandleCrouchPressed()
 {
+	if (InteractorComponent && InteractorComponent->OwnsCapsuleFacing()) return;
+	// 매달린 채 크라우치 = 놓기. 점프 홀드도 함께 푼다 - 쥔 채 떨어지면 공중 체크가 곧바로 같은 렛지를 다시 잡는다.
+	if (TraversalComponent && TraversalComponent->IsHanging())
+	{
+		bJumpInputHeld = false;
+		TraversalComponent->RequestHangDrop();
+		return;
+	}
+	// 등반 중 크라우치 = 벽에서 놓기. 매달림과 같은 규약이다.
+	if (TraversalComponent && TraversalComponent->IsClimbing())
+	{
+		bJumpInputHeld = false;
+		TraversalComponent->RequestClimbDrop();
+		return;
+	}
+	// 자세 관문(설계 .sw/crouch-montage 2.1~2.2) - 앉기·일어서기 양쪽. 이 능력은 캡슐만 바꾸고 몽타주를 멈추지 않아서,
+	//   몸통을 쓰는 동작 도중에 바꾸면 «서기 몽타주 + 앉은 캡슐»(또는 반대)이 된다. 일어서기(토글 끄기)는 능력의 막기 태그를 안 타서 여기서 같은 묶음을 묻는다.
+	//   태그 없는 몽타주(제자리 회전·트래버설·상호작용)도 같은 이유로 막는다. 막으면 한 줄 남긴다 - 조용히 버리면 «C 가 안 먹는다» 와 구별이 안 된다.
+	if (const UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+	    ASC && ASC->HasAnyMatchingGameplayTags(UVBGA_Crouch::GetPostureBlockingTags()))
+	{
+		FGameplayTagContainer Owned;
+		ASC->GetOwnedGameplayTags(Owned);
+		VB_LOG(Log, "자세 전환 막음(%s) - %s", bIsCrouched ? TEXT("일어서기") : TEXT("앉기"),
+			*Owned.Filter(UVBGA_Crouch::GetPostureBlockingTags()).ToStringSimple());
+		return;
+	}
+	if (const UAnimInstance* Anim = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr; Anim && Anim->IsAnyMontagePlaying())
+	{
+		const UAnimMontage* Playing = Anim->GetCurrentActiveMontage();
+		VB_LOG(Log, "자세 전환 막음(%s) - 몽타주 %s 재생 중", bIsCrouched ? TEXT("일어서기") : TEXT("앉기"), *GetNameSafe(Playing));
+		return;
+	}
+	if (UVBSlideMovementComponent* SlideCMC = Cast<UVBSlideMovementComponent>(GetCharacterMovement());
+		SlideCMC && SlideCMC->IsSliding())
+	{
+		SlideCMC->CancelSlide(true);
+		return;
+	}
+	// Sprint+Crouch: the existing input starts a predicted CMC slide. Ordinary crouch still uses GAS.
+	if (bIsSprinting)
+	{
+		if (UVBSlideMovementComponent* SlideCMC = Cast<UVBSlideMovementComponent>(GetCharacterMovement());
+			SlideCMC && SlideCMC->CanRequestSlide() &&
+			(!GetMesh() || !GetMesh()->GetAnimInstance() || !GetMesh()->GetAnimInstance()->IsAnyMontagePlaying()))
+		{
+			Crouch();
+			SlideCMC->RequestSlide();
+			return;
+		}
+	}
 	HandleAbilityInputPressed(VBGameplayTags::Input_Crouch);
 }
 
@@ -1354,6 +1829,29 @@ void AVBCharacter::HandleSprintReleased()
 	HandleAbilityInputReleased(VBGameplayTags::Input_Sprint);
 }
 
+void AVBCharacter::HandleInteractPressed()
+{
+	if (InteractorComponent && InteractorComponent->OwnsCapsuleFacing())
+	{
+		HandleAbilityInputPressed(VBGameplayTags::Input_Interact);
+		return;
+	}
+	if (SmartObjectInteraction && SmartObjectInteraction->IsInteracting())
+	{
+		SmartObjectInteraction->RequestExit();
+		return;
+	}
+	if ((!InteractorComponent || !InteractorComponent->FindBestInteractable()) &&
+		SmartObjectInteraction && SmartObjectInteraction->TryInteract()) return;
+	HandleAbilityInputPressed(VBGameplayTags::Input_Interact);
+}
+
+void AVBCharacter::HandleInteractReleased()
+{
+	// 홀드만 취소한다. 탭의 정렬/몽타주는 키를 뗀 뒤에도 이어진다.
+	HandleAbilityInputReleased(VBGameplayTags::Input_Interact);
+}
+
 void AVBCharacter::HandleSummonWeaponPressed()
 {
 	HandleAbilityInputPressed(VBGameplayTags::Input_WeaponSummon);
@@ -1361,6 +1859,15 @@ void AVBCharacter::HandleSummonWeaponPressed()
 
 void AVBCharacter::HandleWeaponSlot(EVBWeaponType RequestedType)
 {
+	// 처형을 거는 중에는 물러난다. 여기서 몽타주가 나가면 처형 애니가 그 자리에서 끊기고
+	//   플러그인이 그것을 「장면 이탈」로 읽어 장면을 통째로 끝낸다(user 결정: 처형은 안 끊긴다).
+	// GA 인 입력(공격·회피·가드)은 UVBGA_Execute 의 차단 목록이 막는다. 이 경로는 GA 를 안 거쳐
+	//   컴포넌트를 직접 부르므로 여기서 스스로 묻는다 - 질의는 공용 한 곳을 쓴다.
+	if (UVBAbilitySystemStatics::IsActorFinishing(this))
+	{
+		return;
+	}
+
 	if (!WeaponStateComponent) return;
 
 	if (WeaponStateComponent->GetCurrentWeaponType() == RequestedType &&
@@ -1384,7 +1891,12 @@ void AVBCharacter::HandleSwitchTarget(const FInputActionValue& Value)
 {
 	if (!TargetLockComponent) return;
 	float Axis = Value.Get<float>();
-	TargetLockComponent->SwitchTarget(Axis);
+	TargetLockComponent->HandleSwitchInput(Axis, InputDeviceManager && InputDeviceManager->IsUsingGamepad());
+}
+
+void AVBCharacter::HandleSwitchTargetReleased()
+{
+	if (TargetLockComponent) TargetLockComponent->ResetSwitchInput();
 }
 
 void AVBCharacter::ApplySprintState(bool bNewSprinting)
@@ -1439,9 +1951,8 @@ void AVBCharacter::UpdateMaxSpeed()
 	const float Zone = StrafeSpeedMapCurve ? StrafeSpeedMapCurve->GetFloatValue(DirectionDeg) : 0.0f;
 
 	// 3) gait_speeds 선택 — 무기타입·무장여부로 프로파일 해석(UVBMovementConfig::ResolveProfile).
-	//    DEC-007 user 모델: 무장 기본 순항 = jog(RunSpeeds 430, 8-way strafe). CapsLock=Walk(165). Sprint 2단 램프.
-	//    BigSword 특례는 소거됐다: 옛 bBigSwordArmed 분기(Run 270 + sprint 585 캡)를 BigSword 프로파일
-	//      (RunSpeeds 270, bSprintRampEnabled=false)로 흡수 — 무기별 속도가 코드 아닌 데이터.
+	//    무장 기본 순항은 저작된 8-way jog 속도에 맞춘다. CapsLock=Walk(165), Sprint는 2단 램프.
+	//    BigSword 특례는 프로파일(bSprintRampEnabled=false)로 흡수한다 — 무기별 속도는 데이터가 소유한다.
 	//    게이트는 MM 풀이다(2026-08-14). 종전 IsInCombat 은 상태2(납도)를 전투 프로파일로 몰았는데,
 	//      납도 클립이 비무장 풀로 바뀌자 보폭과 클립의 출처가 갈렸다 — 대검 납도에서 속도 270 에
 	//      500 기준 클립이 재생돼 워프비 0.54(하한 0.85 클램프), user FEEL "MM Loco 가 엄청 이상하다".
@@ -1474,9 +1985,18 @@ void AVBCharacter::UpdateMaxSpeed()
 	else                            GaitSpeeds = P.RunSpeeds;
 
 	// 4) Zone lerp — 0..1: Fwd→Strafe (X→Y), 1..2: Strafe→Back (Y→Z).
-	const float NewMaxSpeed = (Zone < 1.0f)
+	float NewMaxSpeed = (Zone < 1.0f)
 		? FMath::Lerp(GaitSpeeds.X, GaitSpeeds.Y, Zone)
 		: FMath::Lerp(GaitSpeeds.Y, GaitSpeeds.Z, Zone - 1.0f);
+	// 45/135도 jog은 별도 저작 클립이다. 축 속도 곡선만 쓰면 Fighter 45도가 약245cm/s인데
+	// 해당 FL/FR45 루트 이동은 약225cm/s라 반복 방향 전환 때 접지한 발이 밀린다.
+	// 0/90/180도에는 영향을 주지 않고 대각선 정점에서만 데이터의 클립 속도에 수렴시킨다.
+	if (MMPool != EVBWeaponType::None && !bIsSprinting && Gait == EVBGait::Run && P.RunDiagonalSpeed > 0.f)
+	{
+		const float NearestDiagonal = DirectionDeg <= 90.f ? 45.f : 135.f;
+		const float DiagonalWeight = 1.f - FMath::Clamp(FMath::Abs(DirectionDeg - NearestDiagonal) / 45.f, 0.f, 1.f);
+		NewMaxSpeed = FMath::Lerp(NewMaxSpeed, P.RunDiagonalSpeed, DiagonalWeight);
+	}
 
 	CMC->MaxWalkSpeed = NewMaxSpeed;
 
@@ -1496,13 +2016,27 @@ void AVBCharacter::ApplyRotationMode()
 	// sprint 이 락온 자동해제하므로 기본은 항상 strafe 면 됨. (WantsToStrafe 기본 true = D 사이드스텝/헤드룩/TIP, FIND-019.)
 	const bool bLockedOn = TargetLockComponent && TargetLockComponent->IsLockedOn();
 	const bool bInCombat = WeaponStateComponent && WeaponStateComponent->IsInCombat();
-	const bool bStrafe = !bIsSprinting && (WantsToStrafe || bLockedOn || bInCombat);
+	const bool bStrafe = !bIsSprinting && (WantsToStrafe || bWantsToAim || bLockedOn || bInCombat);
 
-	CMC->bOrientRotationToMovement     = !bStrafe;
+	// 트래버설 컴포넌트가 캡슐 «얼굴» 을 매 틱 쓰는 상태(매달림·등반·사다리)에서는 둘 다 끈다.
+	//   이들은 MOVE_Flying 이라 루트모션 게이트(IsCapsuleRotationOwnedByFeature)가 안 막는 경로 -
+	//   PhysicsRotation 은 루트모션이 없는 틱에도 돌아 컨트롤 회전(카메라) 쪽으로 캡슐을 돌린다.
+	//   복구가 이 함수를 다시 불러 되돌린다.
+	// 목록을 여기 나열하지 않고 술어를 부르는 이유(2026-09-20): 종전에는 이 줄이 매달림·등반 둘을
+	//   손으로 나열했고, 사다리가 들어오면서 그 목록에 안 들어갔다. 그래서 사다리에서 캡슐이 카메라를
+	//   따라 돌아 캐릭터가 옆으로 붙었고, 손발 IK 가 깊이 자리에서 좌우 오프셋을 읽어 63cm 로 튀었다.
+	//   «누가 얼굴을 쓰는가» 를 아는 것은 그 컴포넌트이므로 판단을 그쪽에 둔다.
+	const bool bFacingOwnedByFeature = (TraversalComponent && TraversalComponent->OwnsCapsuleFacing()) ||
+		UVBFinisherComponent::IsActorInScene(this) ||
+		(PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive()) ||
+		(SmartObjectInteraction && SmartObjectInteraction->OwnsCapsuleFacing()) ||
+		(InteractorComponent && InteractorComponent->OwnsCapsuleFacing());
+
+	CMC->bOrientRotationToMovement     = !bStrafe && !bFacingOwnedByFeature;
 	// GASP UpdateRotation Branch 1 (gasp_full_reference.md:589-598): Strafe → true, Free → false.
 	// Strafe 시 capsule 이 ControlRotation 방향으로 부드럽게 회전해야 trajectory 가 facing 과 일치 →
 	// MM 이 forward anim 선택. false 강제 시 capsule yaw 고정 → trajectory backward → backward anim 회귀(2026-05-23).
-	CMC->bUseControllerDesiredRotation = bStrafe;
+	CMC->bUseControllerDesiredRotation = bStrafe && !bFacingOwnedByFeature;
 
 	// RotationRate 는 UpdateRotationRateForMovementMode() 가 매 tick 갱신 (Grounded=-1, Falling=(0,500,0)).
 	// OffsetRootBone (Accumulate) + RootMotion 이 시각 회전을 담당하므로 instant snap 허용.
@@ -1540,6 +2074,111 @@ void AVBCharacter::ServerApplySprintState_Implementation(bool bNewSprinting)
 bool AVBCharacter::ServerApplySprintState_Validate(bool bNewSprinting)
 {
 	return true;
+}
+
+// 회복 캔슬 직후 이동 상태 추적. 0 = 조용(기본). 1 = 캔슬 시점부터 0.05초 간격 8표본을 [ComboTrace] 로 찍는다.
+// 왜 남기나: 2026-09-07 user 관측 「카타나 3타 뒤 Idle 이 아니라 Run 갔다가 Idle」의 원인을 가르는 유일한 수단이다.
+//   정적으로 잰 것 - 3타 창 닫힘이 클립의 루트모션 203cm/s 구간에 걸린다(1/2/4타는 85/12/87). 그러나
+//   그 속도가 캡슐에 «남는지» 는 런타임에서만 보이고, 이 프로젝트에서 PIE 는 user 몫이다.
+// 2026-09-07 조사 종료로 기본값을 1 에서 0 으로 되돌렸다(약속대로). 계측 자체는 남긴다 -
+//   이 두 줄이 「캔슬 뒤 미끄러짐」을 가른 유일한 수단이었고, 같은 부류가 다른 무기·다른 타에서 또 나올 수 있다.
+//   켜는 법: 콘솔 `vb.Combat.RecoveryCancelTrace 1`. 캔슬 한 번에 8줄이라 상시로 두기에는 시끄럽다.
+static TAutoConsoleVariable<int32> CVarRecoveryCancelTrace(
+	TEXT("vb.Combat.RecoveryCancelTrace"),
+	0,
+	TEXT("Combo recovery-cancel trace: 0=off, 1=log [ComboTrace] speed/root-motion for 0.4s after each cancel."),
+	ECVF_Default
+);
+
+void AVBCharacter::StopResidualAttackMotion(float RestoreAfterSeconds, const UAnimMontage* SourceMontage)
+{
+	UCharacterMovementComponent* CMC = GetCharacterMovement();
+	if (!CMC || !CMC->IsMovingOnGround() || CMC->HasRootMotionSources()
+		|| CMC->GetCurrentAcceleration().Size2D() > KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+	const FAnimMontageInstance* RootMotionOwner = GetRootMotionAnimMontageInstance();
+	if (RootMotionOwner && RootMotionOwner->Montage != SourceMontage) return;
+	const FAnimMontageInstance* RecoveryInstance = RootMotionOwner;
+	if (!RecoveryInstance && GetMesh() && GetMesh()->GetAnimInstance())
+	{
+		const auto& Instances = GetMesh()->GetAnimInstance()->MontageInstances;
+		for (int32 Index = Instances.Num() - 1; Index >= 0; --Index)
+			if (Instances[Index] && Instances[Index]->Montage == SourceMontage
+				&& Instances[Index]->GetWeight() > ZERO_ANIMWEIGHT_THRESH)
+			{
+				RecoveryInstance = Instances[Index];
+				break;
+			}
+	}
+
+	// 이미 쌓인 속도를 버린다. 한 번으로는 안 된다 - 이 함수는 몽타주 노티 처리 중에 불리는데
+	//   그 프레임의 이동 적용은 아직 오지 않았다. 그래서 지운 속도를 같은 프레임의 루트모션이 도로 채운다.
+	//   2026-09-07 [ComboTrace] 실측이 그것을 보여줬다: 캔슬 278 -> 다음 프레임 272 -> 관성으로 0.2초 감속.
+	//   아래 마감 시각을 세워 Tick 이 그 구간 내내 누르게 한다.
+	CMC->StopMovementImmediately();
+	// 이미 완료된 몽타주는 속도만 버린다. 이후 회피/피격/새 공격까지 누르는 타이머를 만들지 않는다.
+	if (!RecoveryInstance) return;
+	ResidualMotionMontageInstanceId = RecoveryInstance->GetInstanceID();
+	if (const UWorld* W = GetWorld())
+	{
+		ResidualMotionSuppressUntil = W->GetTimeSeconds() + FMath::Max(0.01f, RestoreAfterSeconds + RecoveryInstance->GetBlend().GetBlendTimeRemaining());
+	}
+
+	// 그래서 남은 구간의 루트모션 «이동» 자체를 0 으로 누른다. 회전과 자세는 건드리지 않는다.
+	SetAnimRootMotionTranslationScale(0.0f);
+
+	// 복구의 주인은 Tick 하나다. 종전에는 타이머도 같은 값을 되돌려 주인이 둘이었다 - 지금은 무해하지만
+	//   한쪽이 조건을 얻으면(예: 입력이 들어오면 즉시 복구) 두 경로가 갈린다. 마감 시각 하나만 남긴다.
+	if (ResidualMotionSuppressUntil <= 0.0)
+	{
+		SetAnimRootMotionTranslationScale(1.0f);   // 마감 시각을 못 세웠으면 즉시 복구 - 0 으로 굳는 것이 최악이다
+	}
+}
+
+void AVBCharacter::BeginRecoveryCancelTrace()
+{
+	if (CVarRecoveryCancelTrace.GetValueOnGameThread() == 0)
+	{
+		return;
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	RecoveryCancelTraceLeft = 8;
+	World->GetTimerManager().ClearTimer(RecoveryCancelTraceTimer);
+	World->GetTimerManager().SetTimer(RecoveryCancelTraceTimer, FTimerDelegate::CreateWeakLambda(this, [this]()
+	{
+		const UCharacterMovementComponent* CMC = GetCharacterMovement();
+		if (!CMC)
+		{
+			return;
+		}
+		// 어느 풀에서 골랐는지까지 찍는다 - 속도가 0 인데도 정지 클립이 나오면 원인은 «현재 속도» 가 아니라
+		//   궤적 «이력» 이다(엔진이 과거 30 표본을 질의에 함께 쓴다). 그 둘은 이 한 줄로만 갈린다.
+		FString Pool = TEXT("(없음)");
+		if (const UVBAnimInstance* VBAnim = Cast<UVBAnimInstance>(GetMesh() ? GetMesh()->GetAnimInstance() : nullptr))
+		{
+			if (const UPoseSearchDatabase* Db = VBAnim->GetCurrentSelectedDatabase())
+			{
+				Pool = Db->GetName();
+			}
+		}
+		VB_LOG(Log, "[ComboTrace] 남은표본 %d | Speed2D %.0f | 루트모션 %s | 가속 %.0f | MM풀 %s",
+		       RecoveryCancelTraceLeft, CMC->Velocity.Size2D(),
+		       IsPlayingRootMotion() ? TEXT("있음") : TEXT("없음"),
+		       CMC->GetCurrentAcceleration().Size2D(), *Pool);
+		if (--RecoveryCancelTraceLeft <= 0)
+		{
+			if (UWorld* W = GetWorld())
+			{
+				W->GetTimerManager().ClearTimer(RecoveryCancelTraceTimer);
+			}
+		}
+	}), 0.05f, true, 0.0f);
 }
 
 void AVBCharacter::ApplyGait(EVBGait NewGait)
@@ -1601,4 +2240,94 @@ void AVBCharacter::NotifyCombatStimulus()
 	if (!HasAuthority()) return;
 	if (!WeaponStateComponent) return;
 	WeaponStateComponent->EnterCombat();
+}
+
+bool AVBCharacter::IsUsingGameplayCamera() const
+{
+	return GameplayCameraComponent && GameplayCameraComponent->CameraReference.IsValid();
+}
+
+void AVBCharacter::SetGASPCameraStyle(FName Style)
+{
+	// Names verified against the original GASP E_CameraStyle asset.
+	if (Style == TEXT("Close") || Style == TEXT("Medium") || Style == TEXT("Far") || Style == TEXT("Debug"))
+		GASPCameraStyle = Style;
+}
+
+void AVBCharacter::SetWantsToAim(bool bAim)
+{
+	if (!HasAuthority() && !IsLocallyControlled()) return;
+	bAim = bAim && !(PlayerRagdollComponent && PlayerRagdollComponent->IsRagdollActive()) &&
+		!(CachedASC.IsValid() && (CachedASC->HasMatchingGameplayTag(VBGameplayTags::State_Dead) ||
+			CachedASC->HasMatchingGameplayTag(VBGameplayTags::State_Combat_Finishing)));
+	bWantsToAim = bAim;
+	if (bAim) StopSprint();
+	ApplyRotationMode();
+	if (!HasAuthority()) ServerSetWantsToAim(bAim);
+}
+
+void AVBCharacter::ServerSetWantsToAim_Implementation(bool bAim)
+{
+	SetWantsToAim(bAim);
+}
+
+void AVBCharacter::OnRepGASPRotationIntent()
+{
+	ApplyRotationMode();
+}
+
+void AVBCharacter::SetGASPSmartObjectWalkState(bool bWalk)
+{
+	if (!HasAuthority()) return;
+	StopSprint();
+	UnCrouch();
+	SetWantsToAim(false);
+	SetWantsToStrafe(false);
+	ApplyGait(bWalk ? EVBGait::Walk : EVBGait::Run);
+	ForceNetUpdate();
+}
+
+void AVBCharacter::RestoreGASPSmartObjectInputState(EVBGait PreviousGait, bool bPreviousStrafe, bool bPreviousAim)
+{
+	if (!HasAuthority()) return;
+	ApplyGait(PreviousGait == EVBGait::Walk ? EVBGait::Walk : EVBGait::Run);
+	SetWantsToStrafe(bPreviousStrafe);
+	SetWantsToAim(bPreviousAim);
+	ForceNetUpdate();
+}
+
+void AVBCharacter::HandleAimPressed() { SetWantsToAim(true); }
+void AVBCharacter::HandleAimReleased() { SetWantsToAim(false); }
+void AVBCharacter::HandleRagdollPressed()
+{
+	if (PlayerRagdollComponent) PlayerRagdollComponent->RequestRagdoll();
+}
+
+void AVBCharacter::RefreshGameplayCamera()
+{
+	if (!GameplayCameraComponent) return;
+	APlayerController* Player = Cast<APlayerController>(GetController());
+	if (Player && Player->IsLocalController() && IsUsingGameplayCamera())
+	{
+		CameraComponent->Deactivate();
+		if (!GameplayCameraComponent->IsActive())
+			GameplayCameraComponent->ActivateCameraForPlayerController(Player, true);
+	}
+	else
+	{
+		if (EnvironmentCameraComponent) EnvironmentCameraComponent->ReleaseCollisionOwnership();
+		if (GameplayCameraComponent->IsActive()) GameplayCameraComponent->Deactivate();
+	}
+}
+
+void AVBCharacter::PawnClientRestart()
+{
+	Super::PawnClientRestart();
+	RefreshGameplayCamera();
+}
+
+void AVBCharacter::NotifyControllerChanged()
+{
+	Super::NotifyControllerChanged();
+	RefreshGameplayCamera();
 }

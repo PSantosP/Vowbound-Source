@@ -9,10 +9,10 @@
 // Enhanced Input
 #include "InputActionValue.h"
 #include "GameplayTagContainer.h"
-#include "VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "Animation/VBAnimationTypes.h"
 #include "Character/VBGuardable.h"     // IVBGuardable — 데미지 hub 탈구체화(FIND-057a)
-#include "Character/VBTeamTypes.h"     // IGenericTeamAgentInterface + EVBTeam
+#include "Types/VBTeamTypes.h"     // IGenericTeamAgentInterface + EVBTeam
 #include "VBCharacter.generated.h"
 
 
@@ -22,14 +22,21 @@ class UInputAction;
 class UInputMappingContext;
 class USpringArmComponent;
 class UCameraComponent;
+class UGameplayCameraComponent;
+class UVBEnvironmentCameraComponent;
 class UVBAbilitySystemComponent;
 class UVBInputDeviceManager;
 class UVBTargetLockComponent;
 class UMotionWarpingComponent;
 class UVBCharacterTrajectoryComponent;
 class UVBWeaponStateComponent;
+class UVBMeleeTraceComponent;
+class UVBFinisherComponent;
+class UContextualAnimSceneActorComponent;
 class UVBTraversalComponent;
 class UVBPlayerRestoreComponent;
+class UVBPlayerReadinessComponent;
+class UVBInteractorComponent;
 
 class UCharacterTrajectoryComponent;
 class UCurveFloat;
@@ -39,6 +46,13 @@ class UVBMovementConfig;
 class UVBTurnInPlaceConfig;
 class UVBCameraConfig;
 class UVBParryConfig;
+class UVBPlayerRagdollComponent;
+class UVBRagdollComponent;
+class UVBContextEffectComponent;
+class UVBLookAtPOIComponent;
+class UVBPlayerAttentionComponent;
+class UVBSlideMovementComponent;
+class UVBGASPSmartObjectComponent;
 
 // 플레이어가 조종하는 실제 Pawn
 // ACharacter가 직접 상속
@@ -64,15 +78,33 @@ public:
 	void StartSprint();
 	void StopSprint();
 	FORCEINLINE bool GetIsSprinting() const { return bIsSprinting; }
+	void OnSlideMovementStateChanged(bool bNewSliding);
+	bool GetIsSliding() const { return bIsSliding; }
 	FORCEINLINE EVBGait GetGait() const { return Gait; }
 	FORCEINLINE UVBInputDeviceManager* GetInputDeviceManager() const { return InputDeviceManager; }
 	FORCEINLINE USpringArmComponent* GetSpringArm() const { return SpringArmComponent; }
 	FORCEINLINE UCameraComponent* GetCamera() const { return CameraComponent; }
+	bool IsUsingGameplayCamera() const;
+	UFUNCTION(BlueprintPure, Category="Vowbound|Camera")
+	FName GetGASPCameraStyle() const { return GASPCameraStyle; }
+	UFUNCTION(BlueprintCallable, Category="Vowbound|Camera")
+	void SetGASPCameraStyle(FName Style);
+	UFUNCTION(BlueprintPure, Category="Vowbound|Camera")
+	bool WantsToAim() const { return bWantsToAim; }
+	UFUNCTION(BlueprintCallable, Category="Vowbound|Camera")
+	void SetWantsToAim(bool bAim);
+	void SetGASPSmartObjectWalkState(bool bWalk);
+	void RestoreGASPSmartObjectInputState(EVBGait PreviousGait, bool bPreviousStrafe, bool bPreviousAim);
+	UVBPlayerRagdollComponent* GetPlayerRagdollComponent() const { return PlayerRagdollComponent; }
+	virtual void PawnClientRestart() override;
+	virtual void NotifyControllerChanged() override;
 	FORCEINLINE UVBTargetLockComponent* GetTargetLockComponent() const { return TargetLockComponent; }
 	FORCEINLINE UMotionWarpingComponent* GetMotionWarpingComponent() const { return MotionWarpingComponent;}
 	FORCEINLINE UVBCharacterTrajectoryComponent* GetTrajectoryComponent() const { return TrajectoryComponent;}
 	FORCEINLINE UVBWeaponStateComponent* GetWeaponStateComponent() const { return WeaponStateComponent;}
 	FORCEINLINE UVBTraversalComponent* GetTraversalComponent() const { return TraversalComponent;}
+	// HUD 프롬프트가 «이 행동에 매핑된 키» 를 묻는 데 쓴다.
+	FORCEINLINE const UInputAction* GetInteractAction() const { return InteractAction; }
 	
 protected:
 	// 소속 세력. 지각의 적대 판정이 여기서 시작한다 - 다른 팀이면 Hostile 이라 AI 가 본다.
@@ -83,6 +115,8 @@ protected:
 
 	UPROPERTY(BlueprintReadOnly, ReplicatedUsing=OnRep_Sprint, Category = "Vowbound|Locomotion")
 	bool bIsSprinting;
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing=OnRep_Sliding, Category="Vowbound|Locomotion")
+	bool bIsSliding = false;
 
 	// 플레이어가 선택한 보행 모드(Walk 또는 Run만). Walk 토글로 Run↔Walk 전환.
 	// Sprint은 별도 bool(bIsSprinting)로 처리 — Sprint 활성 시 이 값은 무시되고 Gait=Sprint로 간주.
@@ -93,14 +127,11 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void PostInitializeComponents() override;
 	virtual void Tick(float DeltaSeconds) override;
+	virtual bool CanJumpInternal_Implementation() const override;
 	virtual void Landed(const FHitResult& Hit) override;
 	virtual void OnRep_PlayerState() override;
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 	virtual void GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const override;
-
-	// GASP UpdateRotation 기법 — 지면/공중에 따라 RotationRate 토글.
-	// Tick 에서 매 프레임 호출. RotationMode 분기(Strafe/OrientToMovement)는 ApplyRotationMode 가 담당.
-	void UpdateRotationRateForMovementMode();
 
 	// 공격 워프 타겟의 수명 관리 — 죽거나 사라진 적, 또는 이미 좁혀져 퇴화한 sync point 를 끊는다.
 	// 정리만 한다(부수효과). 종전에는 "회전 주도권을 쥐었는가"를 함께 반환했는데, 이름이 말하는 일과
@@ -128,6 +159,8 @@ protected:
 	UFUNCTION()
 	void OnRep_Sprint();
 	UFUNCTION()
+	void OnRep_Sliding();
+	UFUNCTION()
 	void OnRep_Gait();
 		
 	
@@ -137,6 +170,14 @@ protected:
 	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Camera")
 	TObjectPtr<UCameraComponent> CameraComponent;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Camera")
+	TObjectPtr<UGameplayCameraComponent> GameplayCameraComponent;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Camera")
+	TObjectPtr<UVBEnvironmentCameraComponent> EnvironmentCameraComponent;
+
+	void RefreshGameplayCamera();
 	
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Input")
 	TObjectPtr<UInputAction> MoveAction;
@@ -188,7 +229,39 @@ protected:
 	
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Input")
 	TObjectPtr<UInputAction> WeaponSlot3Action;
-	
+
+	// 환경 상호작용. 누름(Started)과 뗌(Completed)을 둘 다 묶는다 - 홀드 대상은 떼면 취소된다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Input")
+	TObjectPtr<UInputAction> InteractAction;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Input")
+	TObjectPtr<UInputAction> RagdollAction;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Input")
+	TObjectPtr<UInputAction> AimAction;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Vowbound|Camera")
+	// GASP 카메라 거리 단계(Close/Medium/Far). 기본값은 GASP SandboxCharacter_CMC 와 같은 Medium.
+	FName GASPCameraStyle = TEXT("Medium");
+	UPROPERTY(ReplicatedUsing=OnRepGASPRotationIntent, BlueprintReadOnly, Category="Vowbound|Camera")
+	bool bWantsToAim = false;
+	UFUNCTION() void OnRepGASPRotationIntent();
+	UFUNCTION(Server, Reliable) void ServerSetWantsToAim(bool bAim);
+	void HandleAimPressed();
+	void HandleAimReleased();
+	void HandleRagdollPressed();
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Ragdoll")
+	TObjectPtr<UVBRagdollComponent> RagdollComponent;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Ragdoll")
+	TObjectPtr<UVBPlayerRagdollComponent> PlayerRagdollComponent;
+	// 애니 순간 이펙트(발 딛음·착지 등). 발소리의 유일한 길 - 옛 GASP Foley 컴포넌트를 흡수하고 뗐다(design .sw/context-effects/design.md §10).
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Effects")
+	TObjectPtr<UVBContextEffectComponent> ContextEffectComponent;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Animation")
+	TObjectPtr<UVBLookAtPOIComponent> LookAtPOI;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Animation")
+	TObjectPtr<UVBPlayerAttentionComponent> PlayerAttention;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Interaction")
+	TObjectPtr<UVBGASPSmartObjectComponent> SmartObjectInteraction;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Input")
 	TObjectPtr<UVBInputDeviceManager> InputDeviceManager;
 	
@@ -201,6 +274,44 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Weapon")
 	TObjectPtr<UVBWeaponStateComponent> WeaponStateComponent;
 
+	// 무기 궤적 적중 판정(.sw/weapon-trace). 공격 GA 가 판정 창을 열면 칼이 지나간 자리를 쓴다.
+	// 왜 생성자인가: 공격은 플레이어의 상시 능력이다. 어느 날(모양)로 쓸지는 BP 기본값의 ShapeSet 이 정한다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Combat")
+	TObjectPtr<UVBMeleeTraceComponent> MeleeTraceComponent;
+
+	// 처형 장면의 주인(DEC-019). 플러그인 접점이 여기 한 곳으로 모인다.
+	// 왜 생성자에서 다나: 처형은 플레이어의 상시 능력이라 조건부로 붙일 이유가 없고,
+	//   BP 에 손으로 다는 방식이면 빠뜨렸을 때 증상이 «아무 일도 안 일어남» 이라 찾기 어렵다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Finisher")
+	TObjectPtr<UVBFinisherComponent> FinisherComponent;
+
+	// 처형 장면의 공격자 자리. 위 컴포넌트가 «장면을 시작하는 쪽» 이라면 이것은 «장면에 들어가는 쪽» 이고,
+	//   플러그인이 두 액터를 묶을 때 양쪽 모두에 이것이 있어야 한다.
+	// 왜 생성자인가: AVBEnemyBase::FinisherSceneComponent 와 같은 근거다(그 주석에 전문이 있다).
+	//   시작 순간에 붙이면 원격 클라에서 도착 순서가 보장되지 않는다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Finisher")
+	TObjectPtr<UContextualAnimSceneActorComponent> FinisherSceneComponent;
+
+	/**
+	 * 화면 전체에 거는 후처리. 지금 드는 것은 처형 준비 외곽선 하나다.
+	 *
+	 * 왜 레벨의 PostProcessVolume 이 아니라 여기인가: 볼륨에 두면 레벨마다 다시 깔아야 하고,
+	 *   빠뜨리면 «그 레벨에서만 조용히 안 나온다». 플레이어에 붙여 두면 어느 레벨이든 따라간다.
+	 * 무한 범위로 둔다(bUnbound) - 플레이어가 어디 서 있든 자기 화면에는 걸려야 한다.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Camera")
+	TObjectPtr<class UPostProcessComponent> PostProcessComponent;
+
+	/**
+	 * 처형 준비 외곽선 머티리얼. 비면 외곽선이 안 나온다(그 외에는 아무 영향 없다).
+	 *
+	 * 왜 데이터인가: 색·굵기는 머티리얼 인스턴스가 들고, 어느 인스턴스를 쓸지는 연출의 선택이다.
+	 *   코드가 특정 자산을 물면 그 선택을 코드 변경으로 바꾸게 된다.
+	 * 대상 메시에 스텐실을 찍는 것은 UVBGC_FinisherWindow 가 한다 - 여기는 «그리는 쪽» 이다.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Camera")
+	TObjectPtr<UMaterialInterface> FinisherOutlineMaterial;
+
 	// 트래버설(맨틀/볼트/허들) 컴포넌트 — IA_Jump 시 TryTraversalAction 우선 시도. GASP CBP TryTraversalAction 포팅.
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Traversal")
 	TObjectPtr<UVBTraversalComponent> TraversalComponent;
@@ -209,13 +320,28 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Save")
 	TObjectPtr<UVBPlayerRestoreComponent> PlayerRestoreComponent;
 
+	UPROPERTY(Transient, VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Player")
+	TObjectPtr<UVBPlayerReadinessComponent> PlayerReadinessComponent;
+
+	// 환경 상호작용 - 가리키는 대상 고르기와 홀드 표시. 판정은 UVBGA_Interact 가 한다.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Vowbound|Interaction")
+	TObjectPtr<UVBInteractorComponent> InteractorComponent;
+
 	void HandleMove(const FInputActionValue& Value);
+
+	// 이동 입력을 뗀 순간. 평소 이동은 이 콜백이 없어도 되지만(호출이 멈추면 CMC 가 알아서 감속한다)
+	//   매달림은 마지막 입력값을 «상태로 들고» 있으므로 누가 0 을 알려주지 않으면 영원히 옆걸음한다
+	//   (2026-09-18 user 「한번 누르면 계속 Loop」). Triggered 는 누르는 동안만 오고 뗄 때 0 을 안 보낸다.
+	void HandleMoveCompleted();
 	void HandleLook(const FInputActionValue& Value);
 	
 	UPROPERTY(VisibleAnywhere, Category="Vowbound|Lock")
 	TObjectPtr<UVBTargetLockComponent> TargetLockComponent;
 	
 private:
+	friend class FVBSlideJumpTestAccess;
+	bool IsSlideJumpSceneAllowed() const;
+
 	// 캐시된 ASC 포인터 (PlayerState 소유, GC-only)
 	UPROPERTY()
 	TWeakObjectPtr<UVBAbilitySystemComponent> CachedASC;
@@ -235,8 +361,11 @@ private:
 	void HandleCrouchPressed();
 	void HandleSprintPressed();
 	void HandleSprintReleased();
+	void HandleInteractPressed();
+	void HandleInteractReleased();
 	void HandleLockOnPressed();
 	void HandleSwitchTarget(const FInputActionValue& Value);
+	void HandleSwitchTargetReleased();
 	void HandleSummonWeaponPressed();
 	void HandleWeaponSlot(EVBWeaponType RequestedType);
 
@@ -250,6 +379,10 @@ private:
 	// 점프 키 홀드 상태 (소유 클라 전용 — 입력 이벤트는 owning client 에서만 발생하므로 복제 불필요).
 	// 공중 맨틀(Vowbound 확장) 게이트: 점프부터 계속 홀드했거나 공중에서 재입력하면 true.
 	bool bJumpInputHeld = false;
+	// Sliding uncrouches in the next movement update. Keep a tapped jump until that update completes.
+	float PendingSlideJumpUntil = 0.f;
+	bool bSlideJumpAwaitingMovement = false;
+	bool bSlideJumpReleaseRequested = false;
 	
 	void ApplySprintState(bool bNewSprinting);
 
@@ -257,7 +390,28 @@ private:
 	void ServerApplySprintState(bool bNewSprinting);
 
 	// 플레이어 Gait 변경 (Walk/Run 만 허용, Sprint은 거부). 서버 권한으로 CMC 속도 갱신.
+public:
+	// 회복 캔슬 직후 짧은 구간의 이동 상태를 찍는다 (진단 전용, 콘솔 `vb.Combat.RecoveryCancelTrace 1`).
+	// 왜 캐릭터가 드나: `UGameplayAbility::EndAbility` 가 그 GA 의 타이머를 전부 지운다(엔진 GameplayAbility.cpp,
+	//   CVar AbilitySystem.ClearAbilityTimers 기본 켬). 회복 캔슬은 EndAbility 로 끝나므로 GA 가 타이머를 들면
+	//   첫 발화 전에 사라진다 - 2026-09-05 회피 커밋에서 같은 자리에 이미 걸렸다.
+	// 무엇을 가르나: 몽타주가 끊긴 뒤 캡슐 속도가 «남아서» 도는지, 아니면 블렌드아웃과 함께 죽는지.
+	//   전자면 모션매칭 쿼리가 그 구간을 «달리는 중» 으로 읽는다.
+	void BeginRecoveryCancelTrace();
+
+	// 공격을 중간에 끊을 때 남는 «의도하지 않은 이동» 을 버린다.
+	// 왜 필요한가: 회복 캔슬은 몽타주를 자연 종료보다 일찍 끊는데, 그 시점의 루트모션 속도는 캡슐에 남는다.
+	//   2026-09-07 실측 - 카타나 3타 창 닫힘에서 Speed2D 305, 이동 입력 0. 모션매칭은 그 캡슐을 정직하게
+	//   «달리는 중» 으로 읽어 주행 포즈를 고른다(user 관측 「3타 뒤 Idle 이 아니라 Run 갔다가 Idle」).
+	// 무엇을 하나: ①이미 쌓인 속도를 버리고 ②남은 블렌드아웃 구간의 루트모션 «이동» 을 0 으로 눌러
+	//   다음 프레임에 다시 밀리지 않게 한다. 자세 블렌드는 그대로라 화면은 부드럽게 이어진다.
+	//   루트모션 스케일은 RestoreAfterSeconds 뒤 1.0 으로 되돌린다 - 이동 입력에는 영향이 없다(루트모션 전용).
+	// 왜 GA 가 아니라 캐릭터가 드나: 되돌림 타이머 때문이다. `EndAbility` 가 그 GA 의 타이머를 전부 지운다.
+	void StopResidualAttackMotion(float RestoreAfterSeconds, const UAnimMontage* SourceMontage);
+
+private:
 	void ApplyGait(EVBGait NewGait);
+
 
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerApplyGait(EVBGait NewGait);
@@ -275,9 +429,25 @@ private:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerHandleAttackInput();
 
+	// 회피 커밋 중 들어온 공격 입력의 시각(월드 초, 서버). -1 = 없음. 커밋이 풀릴 때 EndDodgeCommit 이 ConsumePendingAttackInput 으로 꺼낸다.
+	double PendingAttackInputTime = -1.0;
+	// 회피 커밋 타이머. 캐릭터가 쥐는 이유: UGameplayAbility::EndAbility 가 GA 의 타이머를 전부 지우는데 커밋(0.45)이 무적(0.4)보다 길다.
+	FTimerHandle DodgeCommitTimerHandle;
+	// 커밋 해제: 태그를 내리고 저장 입력을 내보낸다(서버).
+	void EndDodgeCommit(float BufferSeconds);
+
 	void ApplySprintCMCState(bool bNewSprinting);
 
 public:
+	// 회피 커밋 시작(서버): State.Combat.DodgeCommit 을 세워 경공격을 막고 CancelSeconds 뒤 EndDodgeCommit. 카운트 고정(재회피로 2 가 되는 것 방지).
+	void BeginDodgeCommit(float CancelSeconds, float BufferSeconds);
+	// 회피가 취소(피격)로 끝났을 때: 커밋과 저장 입력을 함께 버린다.
+	void CancelDodgeCommit();
+	// 커밋이 풀릴 때 저장된 공격 입력을 내보낸다. 나이가 BufferSeconds 를 넘으면 버린다. 서버 전용.
+	void ConsumePendingAttackInput(float BufferSeconds);
+	// 저장된 공격 입력을 버린다(회피가 피격 등으로 취소됐을 때).
+	void ClearPendingAttackInput();
+
 	// 콤보 section 즉시 전환을 sim proxy에 강제 전달하기 위한 Multicast.
 	// RepAnimMontageInfo Position 기반 복제가 3+ 연속 JumpToSection을 제대로 전달 못하는 UE 5.7 한계 회피.
 	// 서버(authority)와 소유 클라는 자기 로컬 경로로 이미 jump 완료 → 이 Multicast에서 skip.
@@ -305,6 +475,11 @@ private:
 	//   StrafeSpeedMapCurve(BP 에셋 참조라 CDO 가 못 담음 — 아래), WantsToStrafe(게임플레이 상태).
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Movement")
 	TObjectPtr<UVBMovementConfig> MovementConfig;
+	// GASP slide loop duplicated with root locked; CMC alone moves the capsule.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Slide")
+	TObjectPtr<UAnimSequence> SlideLoopAnimation;
+	UPROPERTY(Transient)
+	TObjectPtr<UAnimMontage> ActiveSlideMontage;
 
 	// 제자리 회전 프로필 (FIND-105, 2026-08-28). 미할당이면 행이 0개인 CDO 디폴트라 어떤 조합도
 	//   «프로필 없음» 이 되고 회전은 종전 경로 그대로다 - 배선 전에도 동작이 안 바뀐다.
@@ -370,7 +545,7 @@ private:
 	// 주의: 트래버설 종료 회전 FEEL 회귀 체크 필수. RotationMode enum(UpdateStates)은 MM 선택 품질을 위해
 	//   여전히 Free 유지 — TIP 게이트는 bCMCStrafeRotation(CMC 진실)로 판정하므로 이원화 무해.
 	// meta=AllowPrivateAccess — private 유지하면서 BP에선 Getter/Setter로 접근.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Vowbound|Locomotion", meta=(AllowPrivateAccess="true"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing=OnRepGASPRotationIntent, Category="Vowbound|Locomotion", meta=(AllowPrivateAccess="true"))
 	bool WantsToStrafe = true;
 
 public:
@@ -380,9 +555,11 @@ public:
 	// Strafe(카메라 방향 고정) / Free(이동 방향 회전) 모드 적용 — 회전 플래그의 단일 진실원.
 	// 정책(DEC-006 ⑧, 2026-06-07 user 확정): Sprint→Free / 전투(상태2·3)·LockedOn→Strafe /
 	//   평상(Unarmed)→WantsToStrafe(기본 true). 상태2(전투·무기Off)도 카메라 페이싱 유지 —
-	//   "돌아서 달림"은 user 거부 (06-07 ArmedExploration→Free 시도 즉시 원복 이력).
+	//   "돌아서 달림"은 user 거부 (06-07 CombatSheathed→Free 시도 즉시 원복 이력).
 	// public 인 이유: WSC 상태 전환이 재평가를 위임 (이중 작성자 금지 — 06-07 PIE 플래그 배터리로 실측된 교훈).
 	void ApplyRotationMode();
+	// CMC 회전 직전/Character Tick의 공유 회전율 정책. 이동·포즈 소유 경계를 현재 상태로 확인한다.
+	void UpdateRotationRateForMovementMode();
 
 	// 이동/로코모션 튜닝 config 접근자 — 미할당 시 CDO 디폴트 fallback (P0 config 패턴 동형).
 	const UVBMovementConfig* GetMovementConfig() const;
@@ -461,6 +638,14 @@ private:
 	void OnHealthChanged(const struct FOnAttributeChangeData& Data);
 
 private:
+	// 회복 캔슬 추적 타이머와 남은 표본 수 (진단 전용).
+	// 남은 이동을 누르는 구간의 마감 시각(월드 시간). 0 이하면 비활성.
+	// 왜 시각인가: 한 번만 지우면 같은 프레임에 루트모션이 다시 덮어쓴다 - 2026-09-07 [ComboTrace] 실측으로
+	//   확인했다(캔슬 278 -> 다음 프레임 272, 이후 관성 감속). 그 구간 내내 매 tick 눌러야 이긴다.
+	double       ResidualMotionSuppressUntil = 0.0;
+	int32 ResidualMotionMontageInstanceId = INDEX_NONE;
+	FTimerHandle RecoveryCancelTraceTimer;
+	int32        RecoveryCancelTraceLeft = 0;
 
 	// BeginPlay 에서 CMC 물리 baseline(감속/가속/마찰/점프/에어컨트롤/crouch/회전율)을 config 로부터 적용.
 	// 생성자 대신 여기서 하는 이유: 생성자 시점엔 MovementConfig(BP 배선) 미해석 → 자산값 반영 불가.
@@ -487,5 +672,5 @@ private:
 	
 	// 마우스 타겟 전환 튜닝값(SwitchTargetMouseThreshold/Cooldown)은 UVBTargetLockConfig 로 이동(데이터화 P0).
 	// FPlatformTime 기반 쿨다운 — 런타임 상태라 캐릭터에 잔류.
-	double LastSwitchTargetTime = 0.0;
+	// 대상 전환의 입력 상태는 TargetLockComponent가 소유한다.
 };

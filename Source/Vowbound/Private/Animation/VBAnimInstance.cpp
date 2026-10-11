@@ -2,12 +2,19 @@
 
 
 #include "Animation/VBAnimInstance.h"
-#include "AbilitySystem/VBGameplayTags.h"
 #include "Character/VBCharacter.h"
+#include "Traversal/VBTraversalComponent.h" // 매달림 상태 미러
 #include "Data/VBTurnInPlaceConfig.h"
+#include "Data/VBMovementConfig.h"
+#include "Data/VBParryConfig.h"
+#include "AbilitySystem/VBGameplayTags.h"
+#include "AbilitySystemComponent.h"
 #include "Animation/VBMotionWarpingNames.h"
 #include "MotionWarpingComponent.h"
 #include "Character/VBTargetLockComponent.h"
+#include "Animation/VBInteractionIK.h"
+#include "Animation/VBEnvironmentInteractionIK.h"
+#include "Character/VBFinisherComponent.h"
 #include "Character/VBWeaponStateComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "PoseSearch/MotionMatchingAnimNodeLibrary.h"
@@ -16,8 +23,82 @@
 #include "ChooserFunctionLibrary.h"
 #include "Vowbound/Vowbound.h"
 #include "AbilitySystem/VBAbilitySystemStatics.h"
+#include "AbilitySystemGlobals.h"
+#include "Animation/VBGASPLocomotionUpdateLibrary.h"
+#include "Animation/VBGASPLocomotionLibrary.h"
+#include "Animation/VBGASPCMCSelectionTypes.h"
+#include "VBGASPStateView.h"
+#include "Chooser.h"
+#include "Animation/VBGASPSlideLibrary.h"
 #include "Animation/AnimClassInterface.h"
+#include "Animation/AnimNodeReference.h"
+#include "Animation/AnimSubsystem_Tag.h"
+#include "BlendStack/AnimNode_BlendStack.h"
 #include "BoneControllers/AnimNode_OffsetRootBone.h"
+#include "Camera/CameraComponent.h"
+#include "UObject/UnrealType.h"
+
+// 본 그래프의 열거 속성에 그 이름표(authored name)가 «있기는» 한가. 지금 값이 무엇인지는 FStateView::Is 가 본다 -
+//   이것은 «이름이 안 맞아 영영 거짓» 과 «아직 그 상태가 아님» 을 가르는 한 번짜리 확인이다(질주 인계 경고).
+//   이름은 파일마다 다르게 둔다 - unity 묶음에서 다른 파일의 static 과 부딪히지 않게.
+static bool SlideHandoffHasEnumName(const VBGASP::FStateView& View, FName PropertyName, const TCHAR* AuthoredName)
+{
+	const FByteProperty* Property = CastField<FByteProperty>(View.Find(PropertyName));
+	if (!Property || !Property->Enum)
+	{
+		return false;
+	}
+	for (int32 Index = 0; Index < Property->Enum->NumEnums(); ++Index)
+	{
+		if (Property->Enum->GetAuthoredNameStringByIndex(Index) == AuthoredName)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// 선택 명령은 실제 혼합 완료보다 먼저 게시된다. 이전 이동 자세가 남아 있는
+// BlendStack을 드러내지 않고, 기존 전신 가드 뒤에서 준비를 마친다.
+static bool IsGuardBaseBlendComplete(UAnimInstance* Linked, const UAnimationAsset* Selected)
+{
+	const IAnimClassInterface* AnimClass = Linked ? IAnimClassInterface::GetFromClass(Linked->GetClass()) : nullptr;
+	const FAnimSubsystem_Tag* Tags = AnimClass ? AnimClass->FindSubsystem<FAnimSubsystem_Tag>() : nullptr;
+	if (!Tags || !Selected) return false;
+	const FAnimNodeReference Reference(Linked, Tags->FindNodeIndexByTag(TEXT("State Machine Blend Stack")));
+	const FAnimNode_BlendStack_Standalone* Stack = Reference.GetAnimNodePtr<FAnimNode_BlendStack_Standalone>();
+	if (!Stack || Stack->AnimPlayers.IsEmpty()) return false;
+	const FBlendStackAnimPlayer& Player = Stack->AnimPlayers[0];
+	// 전신 Slot은 그 뒤에서 준비하는 source를 inactive로 표시할 수 있다.
+	// 따라서 표시 활성 여부가 아니라 실제 자산·재생 개시·혼합 완료를 본다.
+	if (Player.GetAnimationAsset() != Selected || Player.IsPostponed()
+		|| Player.GetBlendInPercentage() < 1.f) return false;
+	if (Player.GetBlendInWeightsNum() > 0)
+	{
+		TArray<float, TInlineAllocator<128>> Weights;
+		Weights.SetNumUninitialized(Player.GetBlendInWeightsNum());
+		Player.GetBlendInWeights(MakeArrayView(Weights));
+		for (float Weight : Weights)
+			if (!FMath::IsFinite(Weight) || Weight < 1.f) return false;
+	}
+	return true;
+}
+
+// 회전 계측(FIND-105 (31)) - 「회전 중 카메라가 움직인다」를 숫자로 가르기 위해 캡슐·메시·카메라 위치와 컨트롤 yaw 를 한 줄로 만든다.
+// 시작·끝에 절대값으로 찍어 두 줄의 차로 이동량을 읽는다(시작값을 따로 기억하지 않아도 된다).
+static FString DescribeTurnPose(const APawn* Pawn)
+{
+	const FVector CapsuleLoc = Pawn->GetActorLocation();
+	FVector MeshOffset = FVector::ZeroVector; FVector CameraLoc = FVector::ZeroVector; float ControlYaw = 0.0f;
+	if (const AVBCharacter* VB = Cast<AVBCharacter>(Pawn))
+	{
+		if (VB->GetMesh()) { MeshOffset = VB->GetMesh()->GetComponentLocation() - CapsuleLoc; }
+		if (VB->GetCamera()) { CameraLoc = VB->GetCamera()->GetComponentLocation(); }
+	}
+	if (const AController* C = Pawn->GetController()) { ControlYaw = C->GetControlRotation().Yaw; }
+	return FString::Printf(TEXT("캡슐=(%.1f,%.1f,%.1f) 메시오프셋=(%.1f,%.1f,%.1f) 카메라=(%.1f,%.1f,%.1f) 컨트롤yaw=%.1f"),
+	                       CapsuleLoc.X, CapsuleLoc.Y, CapsuleLoc.Z, MeshOffset.X, MeshOffset.Y, MeshOffset.Z, CameraLoc.X, CameraLoc.Y, CameraLoc.Z, ControlYaw);
+}
 
 // GASP `a.AnimNode.MotionMatching.LOD` 의 Vowbound 대응 — Master CHT 의 Dense/Sparse 분기 입력.
 // 0 = Dense (모든 anim, 가까운 거리 또는 hi-fidelity LOD), 1 = Sparse (필수만, 원거리 또는 lo LOD).
@@ -59,6 +140,15 @@ namespace VBTIPSlot
 void UVBAnimInstance::NativeInitializeAnimation()
 {
 	Super::NativeInitializeAnimation();
+	bOffsetRootBoneNodeResolved = false;
+	CachedOffsetRootBoneNode = nullptr;
+	GASPLocomotionInstance = nullptr;
+	GASPSlideInstance = nullptr;
+	bUseGuardLocomotionPose = false;
+	GuardBlendReadyChooser.Reset();
+	bUseGASPSlidePose = false;
+	bUseOriginalGASPUnarmed = !UsesWeaponLocomotion();
+	bGASPSlideEntered = false;
 
 	RootYawOffset      = 0.0f;
 	bShouldTurnInPlace = false;
@@ -88,9 +178,108 @@ void UVBAnimInstance::NativeInitializeAnimation()
 	// CDO 가 비어있으면 MM 결과 없음 (Anim=?, T-pose) — 명시적 실패가 silent fallback 보다 안전.
 }
 
+void UVBAnimInstance::RequestGASPEarlyTransition_Implementation(bool bToLoop)
+{
+	for (const FName Tag : {FName(TEXT("GASPLocomotion")), FName(TEXT("GASPSlide")), FName(TEXT("GASPUnarmed"))})
+	{
+		if (UAnimInstance* Linked = GetLinkedAnimGraphInstanceByTag(Tag))
+		{
+			const FName Flag = bToLoop ? TEXT("NotifyTransition_ToLoop") : TEXT("NotifyTransition_Re-Transition");
+			if (FBoolProperty* Field = FindFProperty<FBoolProperty>(Linked->GetClass(), Flag))
+				Field->SetPropertyValue_InContainer(Linked, true);
+		}
+	}
+}
+
+bool UVBAnimInstance::ShouldSuppressAttackLocomotion(const ACharacter* Character)
+{
+	const UCharacterMovementComponent* CMC = Character ? Character->GetCharacterMovement() : nullptr;
+	if (!CMC || !CMC->IsMovingOnGround() || CMC->GetCurrentAcceleration().Size2D() > KINDA_SMALL_NUMBER
+		|| !UVBAbilitySystemStatics::IsAttacking(UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Character))) return false;
+	const UAnimInstance* Anim = Character->GetMesh() ? Character->GetMesh()->GetAnimInstance() : nullptr;
+	if (!Anim) return false;
+	// Stop clears the active root-motion reference before broadcasting BlendOut.
+	// The weighted montage remains the recovery pose until its instance terminates.
+	for (const FAnimMontageInstance* Instance : Anim->MontageInstances)
+		if (Instance && Instance->Montage && Instance->Montage->HasRootMotion()
+			&& (Instance->IsActive() || Instance->GetWeight() > ZERO_ANIMWEIGHT_THRESH)) return true;
+	return false;
+}
+
+bool UVBAnimInstance::CanUseGuardLocomotionPose() const
+{
+	const AVBCharacter* Character = Cast<AVBCharacter>(TryGetPawnOwner());
+	const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+	if (!bEnableGuardTurnPose || !bUseGASPLocomotion || bPoseOwnedByMontage || RagdollState.bPowered || bUseGASPSlidePose
+		|| !Movement || !Movement->IsMovingOnGround() || Movement->IsCrouching()
+		|| !Movement->GetCurrentAcceleration().IsNearlyZero()
+		|| Movement->Velocity.SizeSquared2D() > FMath::Square(MoveThreshold))
+	{
+		return false;
+	}
+
+	const UAbilitySystemComponent* ASC = Character->GetAbilitySystemComponent();
+	const UVBWeaponStateComponent* Weapon = Character->GetWeaponStateComponent();
+	const UVBParryConfig* Config = Character->GetParryConfig();
+	const FVBGuardSet* Set = Config && Weapon ? Config->FindGuardSet(Weapon->GetCurrentWeaponType()) : nullptr;
+	if (!ASC || !ASC->HasMatchingGameplayTag(VBGameplayTags::State_Combat_Guarding)
+		|| !Set || !Set->GuardLocomotionChooser || !Set->GuardMontage || !Montage_IsPlaying(Set->GuardMontage)
+		|| Montage_GetCurrentSection(Set->GuardMontage) != Set->GuardLoopSection)
+	{
+		return false;
+	}
+
+	// 피격/받아넘김 등 다른 전신 연출의 블렌드아웃까지 끝나야 하체를 돌려받는다.
+	for (const FAnimMontageInstance* Instance : MontageInstances)
+	{
+		if (Instance && Instance->Montage != Set->GuardMontage
+			&& (Instance->IsActive() || Instance->GetWeight() > ZERO_ANIMWEIGHT_THRESH))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+UChooserTable* UVBAnimInstance::GetRequestedGuardLocomotionChooser() const
+{
+	if (!CanUseGuardLocomotionPose()) return nullptr;
+	const AVBCharacter* Character = Cast<AVBCharacter>(TryGetPawnOwner());
+	const UVBWeaponStateComponent* Weapon = Character ? Character->GetWeaponStateComponent() : nullptr;
+	const UVBParryConfig* Config = Character ? Character->GetParryConfig() : nullptr;
+	const FVBGuardSet* Set = Config && Weapon ? Config->FindGuardSet(Weapon->GetCurrentWeaponType()) : nullptr;
+	return Set ? Set->GuardLocomotionChooser.Get() : nullptr;
+}
+
 void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
 	Super::NativeUpdateAnimation(DeltaSeconds);
+	const APawn* RagdollPawn = TryGetPawnOwner();
+	const UVBRagdollComponent* Ragdoll = RagdollPawn ? RagdollPawn->FindComponentByClass<UVBRagdollComponent>() : nullptr;
+	RagdollState = Ragdoll ? Ragdoll->GetAnimationState() : FVBRagdollAnimationState();
+	if (bUseGASPLocomotion)
+	{
+		UAnimInstance* Linked = GetLinkedAnimGraphInstanceByTag(UsesWeaponLocomotion() ? TEXT("GASPLocomotion") : TEXT("GASPUnarmed"));
+		if (Linked != GASPLocomotionInstance)
+		{
+			bOffsetRootBoneNodeResolved = false;
+			CachedOffsetRootBoneNode = nullptr;
+			GASPLocomotionInstance = Linked;
+			if (Linked && UVBGASPLocomotionLibrary::ConfigureFootPlacementPelvis(
+				Linked, FootPlacementPelvisMaxOffset, FootPlacementPelvisStiffness) == 0)
+			{
+				VB_LOG(Warning, "[FootPlacement] Linked locomotion pelvis settings were not applied");
+			}
+		}
+		// The native traversal/finisher owns this transform. The imported graph gets
+		// a game-thread snapshot just like its CharacterProperties input.
+		if (Linked)
+		{
+			FStructProperty* Transform = FindFProperty<FStructProperty>(Linked->GetClass(), TEXT("InteractionTransform"));
+			if (Transform && Transform->Struct == TBaseStructure<FTransform>::Get())
+				Transform->CopyCompleteValue(Transform->ContainerPtrToValuePtr<void>(Linked), &InteractionTransform);
+		}
+	}
 
 	APawn* Pawn = TryGetPawnOwner();
 	if (!Pawn)
@@ -110,9 +299,90 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 		return;
 	}
 
-	// 이 호출은 반드시 UpdateTurnInPlaceState(아래 :315) 보다 앞이어야 한다 - 그쪽 사망 게이트가
-	// 여기서 갱신한 bIsDead 를 재사용한다(ASC 를 같은 프레임에 두 번 조회하지 않기 위함).
-	UpdateDeathState(Pawn);
+	// 이 호출은 반드시 UpdateTurnInPlaceState(아래 :1250) 보다 앞이어야 한다 - 그쪽 포즈 소유 게이트가
+	// 여기서 갱신한 bPoseOwnedByMontage 를 재사용한다(ASC 를 같은 프레임에 두 번 조회하지 않기 위함).
+	// 순서가 뒤집히면 한 프레임 낡은 판정이 되어 TIP 이 사망·처형 몽타주를 끊는다.
+	UpdatePoseOverrideState(Pawn);
+	UAnimInstance* SlideGraph = bUseGASPLocomotion ? GetLinkedAnimGraphInstanceByTag(TEXT("GASPSlide")) : nullptr;
+	GASPSlideInstance = SlideGraph;
+	const AVBCharacter* VBCharacter = Cast<AVBCharacter>(Character);
+	if (bUseGASPSlidePose && SlideGraph)
+		bGASPSlideEntered |= UVBGASPSlideLibrary::HasEnteredSlide(SlideGraph);
+	// 미끄러지는데 슬라이드 그래프가 없으면 그림 없이 서서 미끄러진다 - 조용히 넘기지 않고 한 번 알린다(ABP 에 GASPSlide 링크가 빠졌을 때).
+	if (!SlideGraph && bUseGASPLocomotion && VBCharacter && VBCharacter->GetIsSliding() && !bWarnedMissingSlideGraph)
+	{
+		bWarnedMissingSlideGraph = true;
+		VB_LOG(Warning, "%s: 슬라이드 중인데 GASPSlide 링크 그래프가 없다 - 슬라이드 포즈 없이 미끄러진다", *GetNameSafe(VBCharacter));
+	}
+	if (SlideGraph && VBCharacter && VBCharacter->GetIsSliding())
+	{
+		bUseGASPSlidePose = true;
+		bGASPSlideEntered |= UVBGASPSlideLibrary::HasEnteredSlide(SlideGraph);
+		SlideExitElapsed = 0.f;
+	}
+	else
+	{
+		SlideExitElapsed += bUseGASPSlidePose ? DeltaSeconds : 0.f;
+		// 질주 키를 쥔 채 슬라이드가 끝났으면 «달려 나오기»(조깅 속도, 약 2.3초)를 끝까지 기다리지 않고 짧게 보인 뒤 본 그래프의 질주로 넘긴다
+		//   (설계 .sw/slide-sprint-resume/fix-design-claude.md - 질주 상태·속도는 정상이고 그림만 늦었다, 01 진단 10-08).
+		const UVBMovementConfig* MoveConfig = VBCharacter ? VBCharacter->GetMovementConfig() : nullptr;
+		// 넘기는 상대(본 그래프)가 이미 «서서 Locomotion Loop» 일 때만 넘긴다. 본 그래프는 숨어 있어도 돈다(ABP_VBCharacter_58 'VBMainLocomotion' 유지 스위치) -
+		//   일어서기 전이와 그 전이가 고르는 출발 클립을 숨은 채 끝내야 인계 순간에 출발 클립이 안 보인다(설계 4차, relevance-katana-held 5.140).
+		//   이름이 안 맞거나 본 그래프가 없으면 거짓 - 질주 지름길이 안 열리고 아래 «슬라이드 나오기 끝» 길로 떨어진다(갇히지 않는다).
+		// 싼 조건이 먼저다 - 이름 조회·열거 문자열은 인계를 실제로 따질 때만(f3 verify 10-08 P1: 종전엔 슬라이드가 아닌 모든 프레임에 돌았다).
+		bool bSprintHandoff = false;
+		if (bGASPSlideEntered && bUseGASPSlidePose && VBCharacter && VBCharacter->GetIsSprinting() && MoveConfig
+			&& SlideExitElapsed >= MoveConfig->SlideSprintExitHandoff)
+		{
+			const VBGASP::FStateView MainView(GASPLocomotionInstance);
+			bSprintHandoff = MainView.Is(TEXT("Stance"), TEXT("Stand")) && MainView.Is(TEXT("StateMachineState"), TEXT("Locomotion Loop"));
+			// 본 그래프·이름표가 실제로 있나는 처음 한 번만 본다. 없으면 지름길이 조용히 영영 닫히므로 한 번 말한다(f3 verify 10-08 Q3).
+			if (!bSprintHandoffNamesChecked)
+			{
+				bSprintHandoffNamesChecked = true;
+				VB_CLOG(!SlideHandoffHasEnumName(MainView, TEXT("Stance"), TEXT("Stand"))
+					|| !SlideHandoffHasEnumName(MainView, TEXT("StateMachineState"), TEXT("Locomotion Loop")), Warning,
+					"%s: 슬라이드 질주 인계가 본 그래프의 Stance=Stand / StateMachineState=Locomotion Loop 를 못 찾는다(그래프 %s) - 질주 지름길 없이 슬라이드 나오기 끝까지 기다린다",
+					*GetNameSafe(VBCharacter), *GetNameSafe(GASPLocomotionInstance));
+			}
+		}
+		// 슬라이드 그래프가 슬라이드에 들어가기 전에 물리 슬라이드가 끝났으면(아주 짧은 슬라이드, 첫 프레임 종료) 기다릴 «나오기» 가 없다 -
+		//   이 줄이 없으면 bGASPSlideEntered 가 영영 거짓이라 위 조건이 안 서고 슬라이드 포즈가 계속 남아 가드·제자리 회전을 막았다(f3 verify 47c1e578).
+		const bool bNeverEntered = !bGASPSlideEntered;
+		if (!SlideGraph || bPoseOwnedByMontage || IsTraversalOwningPose() || RagdollState.bPowered || bNeverEntered
+			|| (bGASPSlideEntered && UVBGASPSlideLibrary::HasCompletedSlideExit(SlideGraph)) || bSprintHandoff)
+		{
+			bUseGASPSlidePose = false;
+			bGASPSlideEntered = false;
+		}
+	}
+	// 요청만으로 일반 Idle 하체를 드러내지 않는다. 전용 선택기의 새 선택이
+	// 완료되기 전에는 DefaultSlot의 가드 자세가 계속 전신을 소유한다.
+	const UChooserTable* GuardChooser = GetRequestedGuardLocomotionChooser();
+	const VBGASP::FStateView GuardView(GASPLocomotionInstance);
+	const FStructProperty* GuardStateProperty = CastField<FStructProperty>(GuardView.Find(TEXT("CMCState")));
+	const FVBGASPCMCState* GuardState = GuardStateProperty && GuardStateProperty->Struct == FVBGASPCMCState::StaticStruct()
+		? GuardStateProperty->ContainerPtrToValuePtr<FVBGASPCMCState>(GASPLocomotionInstance) : nullptr;
+	const bool bGuardSelectionReady = GuardChooser && GuardState && GuardState->ActiveChooser == GuardChooser
+		&& GuardState->bHasSelection && !GuardState->bSelectionContractFailed && !GuardState->bWaitingForPhase;
+	if (!bGuardSelectionReady || GuardBlendReadyChooser.Get() != GuardChooser)
+		GuardBlendReadyChooser.Reset();
+	if (bGuardSelectionReady && !GuardBlendReadyChooser.IsValid())
+	{
+		const FStructProperty* InputsProperty = CastField<FStructProperty>(GuardView.Find(TEXT("CMCBlendInputs")));
+		const FVBGASPCMCBlendInputs* Inputs = InputsProperty && InputsProperty->Struct == FVBGASPCMCBlendInputs::StaticStruct()
+			? InputsProperty->ContainerPtrToValuePtr<FVBGASPCMCBlendInputs>(GASPLocomotionInstance) : nullptr;
+		if (Inputs && IsGuardBaseBlendComplete(GASPLocomotionInstance, Inputs->Anim))
+			GuardBlendReadyChooser = const_cast<UChooserTable*>(GuardChooser);
+	}
+	bUseGuardLocomotionPose = bGuardSelectionReady && GuardBlendReadyChooser.Get() == GuardChooser;
+	bReleaseGASPRootOffset = IsTraversalOwningPose()
+		|| (IsAnyMontagePlaying() && !bUseGuardLocomotionPose) || RagdollState.bPowered;
+
+	// 상호작용 손 IK. 상호작용 중이 아니면 꺼진 상태로 돌아오므로 매 프레임 불러도 된다.
+	//   게임 스레드여야 한다 - 몽타주 상태를 본다.
+	UVBInteractionIKLibrary::Update(this, GetInteractionResult(), DeltaSeconds, InteractionIK);
+	VBEnvironmentInteractionIK::Update(this, InteractionIK);
 
 	// _LastFrame shift — frame 시작점에서 직전 프레임의 값을 _LastFrame 으로 캐시.
 	// UpdateStates 말미에서 하면 같은 frame 내 inline 갱신값이 _LastFrame 에 들어가버려
@@ -131,13 +401,14 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 
 	// GASP UpdateEssentialValues / UpdateStates 이식 — ABP BP 함수들이 기대하는 변수 세트 선계산.
 	// (Speed2D, Velocity_LastFrame, VelocityAcceleration, LastNonZeroVelocity, HasVelocity/Acceleration)
+	bSuppressAttackLocomotion = ShouldSuppressAttackLocomotion(Character);
 	UpdateEssentialValues(DeltaSeconds, Character, CMC);
 
 	// 공통 변수
 	// ForwardSpeed / RightSpeed: Velocity를 로컬 방향으로 분해.
 	// 멤버 Velocity 는 아래 UpdateEssentialValues 에서 저장되므로 이 블록은 local 변수명 충돌 피하기 위해
 	// CurrentVel 로 명명.
-	const FVector CurrentVel    = Character->GetVelocity();
+	const FVector CurrentVel    = Velocity;
 	const FVector ForwardVector = Character->GetActorForwardVector();
 	const FVector RightVector   = Character->GetActorRightVector();
 
@@ -214,7 +485,12 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 
 		// Sprint 풀 합류 자격 — 의도(홀드) 즉시 ON / 해제 후엔 감속이 SprintPoolJoinSpeed 아래로
 		// 떨어질 때까지 유지(핸드오프 보존). 발도/스왑 감쇠 구간(의도 없음·자격 이력 없음)은 차단.
-		bSprintPoolEligible = bIsSprinting || (bSprintPoolEligible && Speed2D >= SprintPoolJoinSpeed);
+		const EVBWeaponType SprintPool = VBChar->GetWeaponStateComponent()
+			? VBChar->GetWeaponStateComponent()->GetMMPool() : EVBWeaponType::None;
+		const UVBMovementConfig* MovementCfg = VBChar->GetMovementConfig();
+		const float JoinSpeed = MovementCfg->ResolveProfile(
+			SprintPool, SprintPool != EVBWeaponType::None).SprintPoolJoinSpeed;
+		bSprintPoolEligible = bIsSprinting || (bSprintPoolEligible && Speed2D >= JoinSpeed);
 		MMSprintGateSpeed   = bSprintPoolEligible ? Speed2D : 0.0f; // Dense CHT Sprint 행 전용 컬럼 입력
 
 		if (UVBWeaponStateComponent* WSC = VBChar->GetWeaponStateComponent())
@@ -222,17 +498,11 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 			// 파쿠르 임시수납 시에는 Unarmed로 표시
 			LocomotionState = WSC->GetEffectiveLocomotionState();
 
-			// raw WSC 상태 캡처 — 아래 crouch 리다이렉트가 평상-crouch 의 enum 을 ArmedExploration 으로
-			// 올리므로, 전투 MM 판정(상태2 포함)은 오염 전의 WSC 진실로만 한다.
-			const EVBLocomotionState RawState = LocomotionState;
-
-			// 평상 crouch 는 MM 에 포즈가 없어 SM 전용 핀(pin3)으로 보낸다.
-			// crouch 시 enum 을 ArmedExploration 으로 올리던 구 리다이렉트는 유지 — LocomotionState 기반
-			// 게이트들(TIP 등)이 crouch 에서 SM 시절과 동일하게 동작해야 한다.
-			if (bIsCrouching && LocomotionState == EVBLocomotionState::Unarmed)
-			{
-				LocomotionState = EVBLocomotionState::ArmedExploration;
-			}
+			// LocomotionState 는 여기서 정해지고 이 함수 안에서 다시 안 바뀐다 — WSC 가 유일한 작성자다.
+			// 2026-09-09 이전에는 평상 crouch 에서 이 값을 한 칸 올리는 리다이렉트(DEC-008)가 있었고,
+			//   그것 때문에 "오염 전 값"을 따로 들고 다녔다. 리다이렉트가 무동작임을 실측하고 지우면서
+			//   그 사본도 함께 없앴다 — 일어나지 않는 오염을 설명하는 주석이 남으면 다음에 읽는 사람이
+			//   여기 무언가 있다고 오해한다.
 			CurrentWeaponType = WSC->GetCurrentWeaponType();
 			WeaponTypeIndex   = ResolveWeaponPoseIndex(CurrentWeaponType);
 
@@ -241,13 +511,11 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 			// MMWeaponType 은 CurrentWeaponType(선택 무기 기억)과 분리된다 - 전용 풀이 없는 무기와 평상
 			//   상태는 None 으로 떨어져 무기 없는 기본 풀을 탄다. 풀 구성(무기별 클립·gait·정규화)의
 			//   정본은 Docs/SystemMap/05_Animation.md.
-			// RawState 로 묻는 이유: crouch 리다이렉트가 LocomotionState 를 ArmedExploration 으로 올려
-			//   오염시키므로, 그 전에 잡아 둔 WSC 진실이라야 납도 중에 발도 풀이 뽑히지 않는다.
-			MMWeaponType = WSC->GetMMPoolForState(RawState);
+			MMWeaponType = WSC->GetMMPoolForState(LocomotionState);
 			const bool bCombatMM = (MMWeaponType != EVBWeaponType::None);
 
 			// R-007: 풀 교체 interrupt — 수렴 래치(무기 스왑) + 발도↔납도 즉시 래치(FIND-030) 통합. → bFirePoolInterrupt.
-			EvaluatePoolInterrupt(DeltaSeconds, CMC, RawState);
+			EvaluatePoolInterrupt(DeltaSeconds, CMC, LocomotionState);
 
 			// stride-warp 는 엔진-네이티브다 (DEC-007 P5, 2026-06-10 확정). MM 노드 PlayRate 인터벌 {0.85, 1.5} 가
 			// 쿼리속도/클립속도 비율(GetEstimatedSpeedRatio)로 재생속도를 자동 워프한다 — jog 350/238=1.47,
@@ -267,8 +535,8 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 				LocomotionStateIndex = static_cast<int32>(EVBLocomotionPin::CombatMM);
 			}
 			// crouch BS 포즈 인덱스 (DEC-008): 발도(전투)=무기별 BS(1 Katana/2 BigSword/3 Fighter) / 수납(평상·경계)=0=ver_A 공용 BS.
-			// RawState(crouch 리다이렉트 전 WSC 진실)로 판정 — 수납 상태인데 칼든 자세(ver_B)가 재생되던 잠복버그 차단.
-			CrouchPoseIndex = (RawState == EVBLocomotionState::ArmedCombat)
+			// 무기On(ArmedCombat)일 때만 무기별 BS — 수납 상태인데 칼든 자세(ver_B)가 재생되던 잠복버그 차단.
+			CrouchPoseIndex = (LocomotionState == EVBLocomotionState::ArmedCombat)
 				                  ? ResolveCrouchPoseIndex(CurrentWeaponType)
 				                  : 0;
 			// SM 경로 = 상태3 비-Fighter SM(pin2) 또는 crouch SM(pin3). MM 핀(0·1)과 흡수/연기 게이트가 갈린다.
@@ -350,19 +618,23 @@ void UVBAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 			}
 
 			// 3. 모드에 따라 RootYawOffset 업데이트
-			UpdateRootYawOffset(DeltaSeconds, ActorYawDelta);
+			if (!bUseGASPLocomotion) UpdateRootYawOffset(DeltaSeconds, ActorYawDelta);
 
 			// R-006: DEBT-006 무장 이동 턴-래그 스프링(감쇠→흡수 순서 고정) → ArmedTurnLagYaw.
-			UpdateTurnLag(DeltaSeconds, ActorYawDelta);
+			if (!bUseGASPLocomotion) UpdateTurnLag(DeltaSeconds, ActorYawDelta);
 		}
 	}
 
 	// TIP 게이트보다 먼저 - 게이트가 이 값을 읽는다(MM 경로).
 	UpdateMeasuredRootYawOffset();
-	UpdateTurnInPlaceState();
+	if (!bUseGASPLocomotion)
+	{
+		UpdateTurnInPlaceState();
+	}
 
 	// GASP UpdateStates 이식 — enum 세트 전환 + _LastFrame 캐시.
 	// NativeUpdateAnimation 말미에서 호출해야 MMState/Gait가 확정된 뒤 shift 됨.
+	bUseOriginalGASPUnarmed = !UsesWeaponLocomotion();
 	UpdateStates();
 }
 
@@ -384,15 +656,8 @@ void UVBAnimInstance::UpdateTrajectory(float DeltaSeconds, ACharacter* Character
 	// 코드가 한 번도 읽지 않아 값이 발산했고, 헤더 주석은 "3.2초 미래 커버"라는 거짓 상태를 설명하고 있었다.
 	// MM 궤적을 디버깅하는 사람이 그 주석을 믿고 3.2초를 가정한 채 원인을 못 찾는 구조였다.
 	// 여기 리터럴이 유일한 진실이다. 값을 바꾸면 MM 로코모션 FEEL 이 전면 변하므로 튜닝은 별건이다.
-	UPoseSearchTrajectoryLibrary::PoseSearchGenerateTransformTrajectory(
-		this, TrajData, DeltaSeconds,
-		/*InOut*/ TempTrajectory,
-		/*InOut*/ DesiredControllerYawLastUpdate,
-		/*Out*/ Trajectory,
-		/*HistorySamplingInterval*/ -1.0f,
-		/*TrajectoryHistoryCount*/ 30,
-		/*PredictionSamplingInterval*/ 0.1f,
-		/*TrajectoryPredictionCount*/ 15);
+	UVBGASPLocomotionUpdateLibrary::GenerateLocomotionTrajectory(this, TrajData, DeltaSeconds,
+		bSuppressAttackLocomotion, TempTrajectory, DesiredControllerYawLastUpdate, Trajectory);
 
 	// GASP HandleTrajectoryWorldCollisions exact: FloorCollisionsOffset=0.01(1mm — 0.0 은 trace MISS →
 	// Z stick 실패 → FV.Z -3000 누적, PIE 실측) / MaxObstacleHeight=150(GASP, default 10000 보다 보수적).
@@ -536,7 +801,7 @@ void UVBAnimInstance::UpdateTurnLag(float DeltaSeconds, float ActorYawDelta)
 }
 
 // R-007 추출 (2026-07-05): 풀 교체 interrupt 2 트리거 통합. NativeUpdateAnimation WSC 블록에서 호출.
-void UVBAnimInstance::EvaluatePoolInterrupt(float DeltaSeconds, UCharacterMovementComponent* CMC, EVBLocomotionState RawState)
+void UVBAnimInstance::EvaluatePoolInterrupt(float DeltaSeconds, UCharacterMovementComponent* CMC, EVBLocomotionState InLocomotionState)
 {
 	// 풀 교체 interrupt — 두 트리거를 한 곳에 통합(R-007). 둘 다 bFirePoolInterrupt(1프레임 펄스)를 발화하지만
 	//   타이밍 의미가 다르다. 로직은 통합 전과 동일(co-locate).
@@ -567,7 +832,7 @@ void UVBAnimInstance::EvaluatePoolInterrupt(float DeltaSeconds, UCharacterMoveme
 	//   무기 이름으로 좁히지 않는 이유: 아래 MMWeaponType 동일 조건이 이미 "풀이 안 바뀐 경우"만 남긴다.
 	//   풀이 바뀌는 무기는 트리거 A 가 처리하고 그 조건에서 걸러지므로 이중 발화가 없다.
 	const bool bMMPoolSheathed = (MMWeaponType != EVBWeaponType::None
-	                              && RawState == EVBLocomotionState::ArmedExploration);
+	                              && InLocomotionState == EVBLocomotionState::CombatSheathed);
 	if (bMMPoolSheathed != bMMPoolSheathed_LastFrame && MMWeaponType == MMWeaponType_LastFrame)
 	{
 		bFirePoolInterrupt = true;
@@ -579,6 +844,21 @@ void UVBAnimInstance::EvaluatePoolInterrupt(float DeltaSeconds, UCharacterMoveme
 void UVBAnimInstance::NativePostEvaluateAnimation()
 {
 	Super::NativePostEvaluateAnimation();
+	if (bUseGASPLocomotion && GASPLocomotionInstance)
+	{
+		// Keep weapon chooser inputs in sync with the graph that actually selected the pose.
+		const FObjectPropertyBase* Selected = FindFProperty<FObjectPropertyBase>(
+			GASPLocomotionInstance->GetClass(), TEXT("CurrentSelectedDatabase"));
+		CurrentSelectedDatabase = Selected ? Cast<UPoseSearchDatabase>(
+			Selected->GetObjectPropertyValue_InContainer(GASPLocomotionInstance)) : nullptr;
+		const FArrayProperty* SelectedTags = FindFProperty<FArrayProperty>(
+			GASPLocomotionInstance->GetClass(), TEXT("CurrentDatabaseTags"));
+		// CMC projects its playback roles (Start/Pivot/Stop) into database-consumer
+		// tags. Reading the source DB again would erase those roles on untagged DBs.
+		CurrentDatabaseTags = SelectedTags && CastField<FNameProperty>(SelectedTags->Inner)
+			? *SelectedTags->ContainerPtrToValuePtr<TArray<FName>>(GASPLocomotionInstance)
+			: (CurrentSelectedDatabase ? CurrentSelectedDatabase->Tags : TArray<FName>());
+	}
 
 	// JustLanded grace 처리 (2026-05-15 H49) — GASP CBP_SandboxCharacter OnLanded 의
 	// "Retriggerable Delay 0.3s" 패턴 이식. VBCharacter::Landed 가 JustLandedClearTime 을
@@ -646,7 +926,7 @@ void UVBAnimInstance::UpdateEssentialValues(float DeltaSeconds, ACharacter* Char
 
 	// GASP PreviousDesiredControllerYaw — ShouldTurnInPlace 가 컨트롤러 회전 변화량 판단에 사용.
 	// 다음 tick 에 전 프레임 값이 남도록 shift 는 함수 말미.
-	const FVector NewVelocity = Character->GetVelocity();
+	const FVector NewVelocity = bSuppressAttackLocomotion ? FVector::ZeroVector : Character->GetVelocity();
 	Velocity = NewVelocity; // GASP helper (IsPivoting/ShouldSpinTransition 등) 가 직접 참조.
 
 	// VelocityAcceleration: 프레임간 delta-v (진짜 가속 = d(v)/dt).
@@ -701,7 +981,11 @@ void UVBAnimInstance::UpdateStates()
 	//   여기에 WantsToStrafe 를 연결하면 idle TIP 영구 불발 회귀를 재현한다. 다시 제안하지 말 것.
 	const bool bLockedOn    = bIsLockedOn;
 	const bool bArmedCombat = (LocomotionState == EVBLocomotionState::ArmedCombat);
-	if (bLockedOn)
+	if (bIsSprinting)
+	{
+		RotationMode = EVBRotationMode::OrientToMovement;
+	}
+	else if (bLockedOn)
 	{
 		RotationMode = EVBRotationMode::OrientToTarget;
 	}
@@ -810,9 +1094,13 @@ void UVBAnimInstance::UpdateRootYawOffset(float DeltaSeconds, float ActorYawDelt
 	}
 }
 
-// 사망 상태를 ABP 로 넘긴다. 사망 포즈에 해로운 두 노드(OffsetRootBone / LegIK)를 끄기 위한 것이다.
+// 저작된 포즈가 로코모션 보정 노드를 이겨야 하는 상황을 ABP 로 넘긴다.
+// 지금 그런 상황이 둘이다 - 사망과 처형 장면. 둘 다 «클립이 정한 자세» 가 정답이고
+//   OffsetRootBone / LegIK 는 살아 움직이는 로코모션 전용이라 그 자세에 능동적으로 해롭다.
+// 종전 이름은 UpdateDeathState 였다. 2026-09-11 에 처형 장면이 두 번째 소유자가 되면서 개명했다 -
+//   이름이 하나만 말하면 다음 사람이 나머지 하나를 못 찾는다.
 // 자세한 이유는 헤더의 bIsDead 주석 참조.
-void UVBAnimInstance::UpdateDeathState(const APawn* OwnerPawn)
+void UVBAnimInstance::UpdatePoseOverrideState(const APawn* OwnerPawn)
 {
 	// 종전에는 여기서 IAbilitySystemInterface 캐스트로 ASC 를 직접 얻었다 - 획득 방법이 프로젝트에 네 갈래로
 	//   갈려 있던 것의 한 갈래였다. 엔진 정본 경로로 통일한다(인터페이스 우선, 없으면 컴포넌트 탐색).
@@ -820,10 +1108,65 @@ void UVBAnimInstance::UpdateDeathState(const APawn* OwnerPawn)
 	const bool bDeadNow = UVBAbilitySystemStatics::IsActorDead(OwnerPawn);
 
 	bIsDead = bDeadNow;
+
+	// 매달림 미러 - 값의 홈은 트래버설 컴포넌트, 여기는 읽기만 한다.
+	const AVBCharacter* VBCharacter = Cast<const AVBCharacter>(OwnerPawn);
+	const UVBTraversalComponent* Traversal = VBCharacter ? VBCharacter->GetTraversalComponent() : nullptr;
+	bIsHanging   = Traversal && Traversal->IsHanging();
+	HangMoveAxis = bIsHanging ? Traversal->GetHangMoveAxis() : 0.0f;
+
+	bIsClimbing = Traversal && Traversal->IsClimbing();
+	bIsOnLadder = Traversal && Traversal->IsOnLadder();
+	const FVector2D ClimbAxis = bIsClimbing ? Traversal->GetClimbMoveAxis() : FVector2D::ZeroVector;
+	ClimbMoveAxisX = static_cast<float>(ClimbAxis.X);
+	ClimbMoveAxisY = static_cast<float>(ClimbAxis.Y);
+
+	// 매달림/등반의 뼈 공간 보정. 사다리는 현재 포즈를 읽는 전용 노드가 담당한다.
+	const FVBHangIKTargets IK = bIsHanging ? Traversal->GetHangIKTargets()
+		: (bIsClimbing ? Traversal->GetClimbIKTargets() : FVBHangIKTargets());
+	HangHandTargetL   = IK.HandL;
+	HangHandTargetR   = IK.HandR;
+	HangFootTargetL   = IK.FootL;
+	HangFootTargetR   = IK.FootR;
+	HangHandIKWeightL = IK.HandWeightL;
+	HangHandIKWeightR = IK.HandWeightR;
+	HangFootIKWeightL = IK.FootLWeight;
+	HangFootIKWeightR = IK.FootRWeight;
+
 	// Release 는 누적 오프셋을 즉시 놓는다. 살아있을 때 값은 노드 기본값과 같아야 로코모션이 안 바뀐다.
-	OffsetRootTranslationMode = bDeadNow ? EOffsetRootBoneMode::Release : EOffsetRootBoneMode::Interpolate;
-	OffsetRootRotationMode    = bDeadNow ? EOffsetRootBoneMode::Release : EOffsetRootBoneMode::Accumulate;
-	LegIKAlpha                = bDeadNow ? 0.0f : 1.0f;
+	// 매달림도 Release - 캡슐을 컴포넌트가 손으로 옮기는 동안 오프셋이 쌓이면 메시가 렛지에서 뒤처진다.
+	const bool bReleaseOffsetRoot = bDeadNow || IsTraversalOwningPose();  // 사다리도 여기 든다
+	OffsetRootTranslationMode = bReleaseOffsetRoot ? EOffsetRootBoneMode::Release : EOffsetRootBoneMode::Interpolate;
+	OffsetRootRotationMode    = bReleaseOffsetRoot ? EOffsetRootBoneMode::Release : EOffsetRootBoneMode::Accumulate;
+
+	// 처형 장면도 LegIK 를 꺼야 하는 자리다 - 사망과 같은 이유이고, 같은 노브를 쓴다.
+	//
+	// 왜: LegIK 의 목표는 클립의 ik_foot_l/r 본이다. 처형 클립은 리타겟 과정에서 그 본이 발을 안 따라오게 됐고
+	//   (2026-09-11 실측: VB_Exec_SSH_02_A_Seq 에서 ik_foot_l 이 foot_l 에서 118cm, 16개 전부 어긋남 -
+	//   리타게터의 타깃 리그에 ik_foot 체인 자체가 없다), LegIK 가 그 엉뚱한 목표로 다리를 끌고 갔다.
+	//   user 가 본 「다리는 처형 애니메이션이 진행 안되는 듯」이 그것이다.
+	// 클립을 고쳐도 이 게이트는 남는 것이 옳다: 저작된 연출 포즈에 지면 적응 IK 를 거는 것 자체가
+	//   해롭다. 사망 포즈에서 이미 같은 판단을 내렸고 그 주석이 헤더에 있다.
+	// 왜 피해자(적)는 안 건드리나: ABP_Enemy_Base 에 IK 노드가 아예 없다(실측 0건, 대조군 플레이어 ABP 10건).
+	// 멤버에 남긴다. TIP 게이트가 같은 값을 읽는다(헤더 선언 주석).
+	bInFinisherScene = UVBFinisherComponent::IsActorInScene(OwnerPawn);
+	// 매달림도 끈다 - 허공에 늘어진 발을 지면에 맞추려 들면 다리가 뒤틀린다.
+	LegIKAlpha       = (bDeadNow || bInFinisherScene || IsTraversalOwningPose()) ? 0.0f : 1.0f;
+
+	// 「저작된 포즈가 지금 이 몸을 쥐고 있다」를 한 값으로 낸다.
+	//
+	// 왜 따로 두나: 로코모션 쪽에서 물을 질문은 «죽었나» 도 «처형 중인가» 도 아니고
+	//   «내가 이 몸을 움직여도 되나» 하나다. 그 질문에 소유자 목록으로 답하면 소유자가 늘 때마다
+	//   묻는 쪽을 전부 고쳐야 하고, 한 곳을 빠뜨리면 그 기능에서만 조용히 되돌아온다.
+	//   실제로 그 되돌아옴을 두 번 겪었다 - 사망 몽타주가 TIP 에 끊겨 시체가 일어섰고(선례),
+	//   처형 몽타주가 같은 자리에서 끊겨 「어쩔 때 처형 애니가 안 나온다」가 됐다(2026-09-13).
+	// 즉 이 값이 늘어날 곳은 여기 한 줄이고, 묻는 쪽은 안 바뀐다. 다음 소유자(연출 컷신 등)는
+	//   이 줄에 OR 를 하나 더하면 끝난다.
+	// bIsDead / bInFinisherScene 을 없애지 않는 이유: 그 둘은 각자 다른 것도 정한다
+	//   (OffsetRootBone 모드 2종은 사망만 보고, 피해자 판정은 장면만 본다). 합치면 그쪽이 거짓말한다.
+	// 매달림도 소유자다 - TIP 몽타주가 TurnInPlace 슬롯으로 매달림 포즈를 덮는 것을 막는다(캡슐이 벽을 보고
+	//   컨트롤 회전은 자유라 TIP 은 늘 «돌아야 할 각» 을 본다).
+	bPoseOwnedByMontage = bDeadNow || bInFinisherScene || IsTraversalOwningPose();
 }
 
 // 메시가 캡슐보다 얼마나 덜 돌았는가를 '측정'한다. 종전 MM 경로는 이 값을 RootYawOffset 에
@@ -834,12 +1177,18 @@ void UVBAnimInstance::UpdateDeathState(const APawn* OwnerPawn)
 //   "Offset = ComponentTransform - SimulatedTransform".
 void UVBAnimInstance::UpdateMeasuredRootYawOffset()
 {
+	UAnimInstance* PoseOwner = bUseGASPLocomotion ? GASPLocomotionInstance.Get() : this;
+	if (!PoseOwner)
+	{
+		MeasuredRootYawOffset = 0.0f;
+		return;
+	}
 	if (!bOffsetRootBoneNodeResolved)
 	{
 		bOffsetRootBoneNodeResolved = true;
 
 		// 이름이나 인덱스가 아니라 타입으로 찾는다 - ABP 를 재배선해도 안 깨진다.
-		if (IAnimClassInterface* AnimClass = IAnimClassInterface::GetFromClass(GetClass()))
+		if (IAnimClassInterface* AnimClass = IAnimClassInterface::GetFromClass(PoseOwner->GetClass()))
 		{
 			for (const FStructProperty* NodeProperty : AnimClass->GetAnimNodeProperties())
 			{
@@ -847,7 +1196,7 @@ void UVBAnimInstance::UpdateMeasuredRootYawOffset()
 					&& NodeProperty->Struct->IsChildOf(FAnimNode_OffsetRootBone::StaticStruct()))
 				{
 					CachedOffsetRootBoneNode =
-						NodeProperty->ContainerPtrToValuePtr<FAnimNode_OffsetRootBone>(this);
+						NodeProperty->ContainerPtrToValuePtr<FAnimNode_OffsetRootBone>(PoseOwner);
 					break;
 				}
 			}
@@ -1027,8 +1376,8 @@ void UVBAnimInstance::UpdateRootMotionTurnInPlace(const UVBTurnInPlaceConfig& In
 		{
 			const float EndYaw   = FRotator::NormalizeAxis(TurnPawn->GetActorRotation().Yaw);
 			const float Delivered = FRotator::NormalizeAxis(EndYaw - TurnStartCapsuleYaw);
-			VB_LOG(Log, "[TIP-RM] end %s 요청=%.1f 실제캡슐회전=%.1f 남은aim=%.1f",
-			       *ActiveRootMotionTurnMontage->GetName(), TurnRequestedYaw, Delivered, AimYaw);
+			VB_LOG(Log, "[TIP-RM] end %s 요청=%.1f 실제캡슐회전=%.1f 남은aim=%.1f | %s",
+			       *ActiveRootMotionTurnMontage->GetName(), TurnRequestedYaw, Delivered, AimYaw, *DescribeTurnPose(TurnPawn));
 		}
 
 		// 끝났으므로 워프 타깃을 거둔다. 남겨두면 다음 회전이 옛 목표를 물려받는다.
@@ -1199,24 +1548,31 @@ void UVBAnimInstance::UpdateRootMotionTurnInPlace(const UVBTurnInPlaceConfig& In
 
 	// aim 은 정규화된 최단 경로, 남은 = 정규화하지 않은 남은 회전량, 요청 = 이번에 내는 조각. 셋이 갈리는 자리가 180 부근이라 함께 찍는다.
 	// (먼길) = 요청 부호가 최단 경로와 다름. «클립 반대방향» = 양방향 행이 반대 요청을 받은 경우.
-	VB_LOG(Log, "[TIP-RM] play %s (weapon=%d crouch=%d 요청=%.1f 남은=%.1f aim=%.1f%s ref=%.1f warp=%.1f rate=%.2f%s)",
+	VB_LOG(Log, "[TIP-RM] play %s (weapon=%d crouch=%d 요청=%.1f 남은=%.1f aim=%.1f%s ref=%.1f warp=%.1f rate=%.2f%s) | %s",
 	       *Entry->Montage->GetName(), static_cast<int32>(MMWeaponType),
 	       bIsCrouching ? 1 : 0, StepYaw, RequestYaw, AimYaw,
 	       (FMath::Sign(StepYaw) != FMath::Sign(AimYaw)) ? TEXT("(먼길)") : TEXT(""),
 	       Entry->ReferenceYaw, WarpYaw, Entry->PlayRate,
-	       (FMath::Sign(Entry->ReferenceYaw) != FMath::Sign(WarpYaw)) ? TEXT(" 클립반대방향") : TEXT(""));
+	       (FMath::Sign(Entry->ReferenceYaw) != FMath::Sign(WarpYaw)) ? TEXT(" 클립반대방향") : TEXT(""),
+	       TryGetPawnOwner() ? *DescribeTurnPose(TryGetPawnOwner()) : TEXT(""));
 }
 
 void UVBAnimInstance::UpdateTurnInPlaceState()
 {
-	// 사망 게이트. TIP 은 몽타주를 트는데 TIP 슬롯이 DefaultGroup 을 공유하므로, 사망 몽타주가
-	// 돌고 있을 때 여기서 Montage_Play 가 나가면 사망 몽타주를 끊어 시체가 다시 일어선다.
-	// 사망 재생이 PlayAnimation(SingleNode)에서 몽타주로 바뀌면서 이 경로가 처음 도달 가능해졌다.
+	// 포즈 소유 게이트. TIP 은 몽타주를 트는데 그 슬롯이 DefaultGroup 을 공유하므로, 저작된 포즈가
+	// 돌고 있을 때 여기서 Montage_Play 가 나가면 그것을 끊는다.
 	//
-	// bIsDead 는 같은 프레임의 UpdateDeathState(NativeUpdateAnimation:83)가 이미 갱신했고 이 함수는
-	// :315 라 항상 최신이다. 조기 반환 3건도 전부 :83 앞이라 "갱신 없이 여기 도달"이 불가능하다.
-	// 순서를 바꾸면 한 프레임 늦은 판정이 되어 사망 몽타주를 TIP 이 끊는다 - 호출 순서가 계약이다.
-	if (bIsDead) return;
+	// 이 자리는 두 번 물렸다. 사망 몽타주를 끊어 시체가 다시 일어섰고(사망 재생이 SingleNode 에서
+	//   몽타주로 바뀌면서 이 경로가 처음 도달 가능해졌다), 2026-09-13 에는 처형 몽타주를 끊어
+	//   「어쩔 때 처형 애니가 안 나온다」가 됐다(자리 맞춤 12ms 뒤 회전 요청 91.1도가 들어와
+	//   3.07초 장면이 0.012초에 종료).
+	// 그래서 소유자를 하나씩 빼는 대신 «누가 쥐고 있나» 를 한 값으로 묻는다 - 소유자가 늘어도
+	//   이 줄은 안 바뀐다. 값의 홈은 UpdatePoseOverrideState 한 곳이다(그 주석에 전문).
+	//
+	// 그 값은 같은 프레임의 UpdatePoseOverrideState(NativeUpdateAnimation:133)가 갱신했고 이 함수는
+	// 그보다 뒤라 항상 최신이다. 조기 반환 3건도 전부 :133 앞이라 "갱신 없이 여기 도달"이 불가능하다.
+	// 순서를 바꾸면 한 프레임 늦은 판정이 되어 그 몽타주를 TIP 이 끊는다 - 호출 순서가 계약이다.
+	if (bPoseOwnedByMontage || bUseGASPSlidePose) return;
 
 	// 소유권은 «못 재면 안 가진 것» 으로 떨어뜨린다 (규칙 27). 캐릭터나 설정이 없어 아래 게이트에
 	//   도달하지 못하면 이 값이 낡은 채 남는데, 낡은 참은 MM 풀을 영영 닫아 놓고 몽타주도 안 도는
@@ -1580,6 +1936,19 @@ EOffsetRootBoneMode UVBAnimInstance::GetOffsetRootTranslationMode() const
 	//   IsSlotActive 는 블렌드아웃 시작 순간 false 로 떨어져(GASP 타이밍) 스냅 프레임에 Accumulate 가 받아낸다.
 	//   (tick 캡처 실측: weight 방식 dRoot=-73.9°/1tick 통과 vs GASP dRoot=0.0°. 일반 로코모션 스냅은 흡수 확인.)
 	//   thread-safety: JustTraversed() 가 동일 IsSlotActive 를 chooser(worker) 컨텍스트에서 상시 호출 중 — 전례 따름.
+	// 트래버설이 캡슐 위치의 주인일 때는 이 노드를 놓는다.
+	//   이 노드의 전제는 「캡슐이 먼저 가고 메시가 따라붙는다」인데, 매달림·등반 동안은 내가 매 프레임
+	//   캡슐을 면 위로 옮겨 놓으므로 그 전제가 거짓이다. 그러면 노드는 그 이동을 전부 「메울 오차」로 읽는다.
+	// 실측(2026-09-19 등반 로그): 정지 상태에서 root 뼈가 옆으로 26cm 밀린 채 12초를 버텼다
+	//   (Z 가 정확히 0 인 것이 이 노드의 bOnGround 서명이다). 왜 Release 가 그것을 못 녹였는지는 미확정이다 -
+	//   그래서 모드 판정에 이 조건을 «먼저» 둔다. 여기서도 안 풀리면 bResetEveryFrame 핀을 빼서 묶어야 한다.
+	// 곁들여: UpdatePoseOverrideState 가 같은 뜻을 멤버 OffsetRootTranslationMode/RotationMode 에 쓰는데
+	//   노드 핀은 이 함수에 묶여 있어 그 멤버를 아무도 안 읽는다. 홈은 여기 하나다.
+	if (IsTraversalOwningPose())
+	{
+		return EOffsetRootBoneMode::Release;
+	}
+
 	if (IsSlotActive(GASP_DefaultSlotName))
 	{
 		return EOffsetRootBoneMode::Release;
@@ -1600,7 +1969,7 @@ EOffsetRootBoneMode UVBAnimInstance::GetOffsetRootTranslationMode() const
 
 float UVBAnimInstance::GetLegIKAlpha() const
 {
-	// 값 계산은 UpdateDeathState 가 끝내고 여기서는 읽기만 한다 (사망 시 0).
+	// 값 계산은 UpdatePoseOverrideState 가 끝내고 여기서는 읽기만 한다 (사망·처형 장면에 0).
 	// 2026-09-01~03: 한때 여기서 TIP 슬롯 가중치로 IK 를 물러나게 했다가 되돌렸다. 회전 끝단에 다리가 튀던
 	//   증상의 원인은 이 노드가 아니라 클립의 IK 부모 뼈(ik_foot_root) 로컬 관례였다(FIND-105 (7)). IK 를 끄는 것은
 	//   증상을 가리는 것이고 지면 적응까지 같이 죽는다. 다음에 같은 증상이 나오면 노드보다 클립의 IK 뼈를
@@ -1620,6 +1989,14 @@ EOffsetRootBoneMode UVBAnimInstance::GetOffsetRootRotationMode() const
 	// SM 경로(상태3 SM/crouch SM)는 RotateRootBone(ArmedRootYawOffset)+TIP 이 흡수를 전담 → 여기선 Release.
 	// MM 경로(Unarmed / 상태2 — Phase A 에서 MM 재사용)는 Accumulate. 시각 회전은 MM 내장 Steering 이 제어.
 	// 구 게이트(state != Unarmed)를 유지하면 상태2-MM 의 회전 흡수가 죽어 통짜 snap 이 재발한다.
+	// 위치와 같은 이유로 트래버설 중에는 회전도 놓는다. 여기가 더 급하다 -
+	//   몽타주가 안 도는 동안 이 함수는 Accumulate 로 떨어지는데, 그 모드는 감쇠 블록에 아예 안 들어가고
+	//   MaxRotationError 가 -1 이라 상한도 없다. 즉 등반 대기 중에 회전 오프셋이 영영 안 풀린다.
+	if (IsTraversalOwningPose())
+	{
+		return EOffsetRootBoneMode::Release;
+	}
+
 	if (bUsesStateMachinePath)
 	{
 		return EOffsetRootBoneMode::Release;
@@ -1894,7 +2271,8 @@ EPoseSearchInterruptMode UVBAnimInstance::GetMMInterruptMode() const
 	const bool bMovementModeChanged = (MovementMode != MovementMode_LastFrame);
 	const bool bGroundedAndOtherChanged =
 		(MovementMode == EVBMovementMode::Grounded) &&
-		((MMState != MMState_LastFrame) || (Gait != Gait_LastFrame) || (Stance != Stance_LastFrame));
+		((MMState != MMState_LastFrame) || (Gait != Gait_LastFrame) || (Stance != Stance_LastFrame)
+		 || (RotationMode != RotationMode_LastFrame));
 	// 무기 스왑 = MM 풀 교체 (K 확장 후속 2026-06-10). 정속 주행 중 슬롯키 스왑(MM↔MM 무기)은 위 4종이
 	// 전부 불변이라 DoNotInterrupt → 이전 무기 풀 continuing pose 잔존(시각적으로 "안 바뀜"). 풀 교체는 절대
 	// interrupt 사유 — 단 발화 시점은 NativeUpdate 의 래치가 보폭 수렴 후 1프레임 펄스로 공급(과도기 블립 방지).
@@ -2103,6 +2481,36 @@ void UVBAnimInstance::CacheMMSelectedDatabase(UPARAM(ref) const FAnimNodeReferen
 		else
 		{
 			CurrentDatabaseTags.Reset();
+		}
+	}
+}
+
+// ============================================================================
+// 처형 상호작용 (GASP 5.8 Pose Search Interaction) — 설계 .sw/gasp58/finisher-interaction-wiring.md
+// ============================================================================
+
+void UVBAnimInstance::EvaluateFinisherDatabases(TArray<UPoseSearchDatabase*>& OutDatabases) const
+{
+	OutDatabases.Reset();
+
+	if (!FinisherChooserTable)
+	{
+		return;
+	}
+
+	// 오브젝트 컨텍스트다. chooser 가 이 AnimInstance 의 프로퍼티를 직접 읽는다 -
+	//   무기는 CurrentWeaponType, 속도는 Speed2D(수평)로 이미 매 틱 갱신되고 있다.
+	//   전용 입력 구조체를 두지 않는 이유는 VBFinisherConfig.h 의 그 자리 주석에 있다.
+	// Multi 인 이유: 검색은 여러 DB 를 한 번에 본다. 한 행만 고르면 모션매칭이 고를 폭이 줄어든다
+	//   (GASP 도 CHT_CharacterInteractionPSDs 를 Multi 로 평가해 배열을 만든다).
+	TArray<UObject*> Selected = UChooserFunctionLibrary::EvaluateChooserMulti(
+		const_cast<UVBAnimInstance*>(this), FinisherChooserTable, UPoseSearchDatabase::StaticClass());
+
+	for (UObject* Entry : Selected)
+	{
+		if (UPoseSearchDatabase* Database = Cast<UPoseSearchDatabase>(Entry))
+		{
+			OutDatabases.AddUnique(Database);
 		}
 	}
 }

@@ -7,7 +7,7 @@
 #include "Character/VBCharacter.h"
 #include "Character/VBTargetLockComponent.h"   // 가드 진입 자동 락온
 #include "Character/VBWeaponStateComponent.h"
-#include "Character/VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "Data/VBParryConfig.h"   // UVBParryConfig::FindGuardSet — 무기 게이트의 데이터 원천(CHORE-032)
 #include "Vowbound/Vowbound.h"
 

@@ -4,6 +4,7 @@
 
 #include "Components/SplineComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Interaction/VBPushableComponent.h"
 
 AVBLevelBlock_Traversable::AVBLevelBlock_Traversable()
 {
@@ -12,6 +13,8 @@ AVBLevelBlock_Traversable::AVBLevelBlock_Traversable()
 	// 장애물 메시를 루트로 — 전방 트레이스가 이 메시를 맞춤(Visibility 채널).
 	ObstacleMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("ObstacleMesh"));
 	SetRootComponent(ObstacleMesh);
+	Pushable = CreateDefaultSubobject<UVBPushableComponent>(TEXT("Pushable"));
+	Pushable->SetupAttachment(ObstacleMesh);
 }
 
 void AVBLevelBlock_Traversable::OnConstruction(const FTransform& Transform)
@@ -164,6 +167,7 @@ void AVBLevelBlock_Traversable::GetLedgeTransforms(const FVector& HitLocation, c
 	Result.bHasFrontLedge = true;
 	Result.FrontLedgeLocation = FrontXform.GetLocation();
 	Result.FrontLedgeNormal = FrontXform.GetRotation().GetUpVector();
+	Result.FrontLedgeSpline = ClosestLedge; // 매달림이 옆걸음 축으로 쓴다
 
 	// 4. 맵으로 반대편(back) 렛지 조회.
 	const TObjectPtr<USplineComponent>* FoundOpposite = OppositeLedges.Find(ClosestLedge);

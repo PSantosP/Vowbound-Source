@@ -1,4 +1,4 @@
-// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #pragma once
 
@@ -51,6 +51,30 @@ public:
 	FVector       GetSlotLocation() const;
 	AActor*       GetCombatTarget() const { return CombatTarget.Get(); }
 
+	// === 계획된 다음 공격 (design .sw/boss/design.md §12.7) - «공격을 먼저 고르고 그 거리까지 간다» ===
+	// 토큰을 받는 순간 코디네이터가 PlanNextAttack 을 부른다. 공격 GA 의 설정 자산에서 변형마다 클립 전진을 재고, 시작 거리 = 전진 + 멈추는 거리.
+	//   후보는 «지금 거리에서 대역 안으로 닿을 수 있는 변형», 그중 순환 커서. 그 뒤 BT 서비스·역할 판정·걸음이 GetAttackStartDistance 를 읽고,
+	//   공격 GA 가 ConsumePlannedVariantIndex 로 같은 변형을 튼다. 계획이 없으면 전부 종전 값(AttackCommitDistance)이라 잡몹 흐름은 그대로다.
+	// 왜 여기가 홈인가: 거리·타겟·설정·GA 스펙이 전부 이 컴포넌트에서 이미 조회된다. 소울 계열 AI 의 «Approach_Act(거리) 뒤 Attack» 과 같은 구조.
+	void  PlanNextAttack(const FVector& TargetLocation);
+	void  ClearPlannedAttack();
+	int32 ConsumePlannedVariantIndex();
+
+	// 시작 거리를 블랙보드에 지금 쓴다(AVBAIController::PushAttackStartDistance). 계획을 세우거나 비운 자리에서만 부른다 -
+	//   서비스의 주기 쓰기는 그대로 남고(폰 교체·자산 폴백), 이것은 «값이 바뀐 순간» 을 MoveTo 시작보다 앞세우는 것이다.
+	void  PushStartDistanceToBlackboard() const;
+	float GetAttackStartDistance() const;
+	float GetAttackReleaseDistance() const;
+
+	// 걸음을 정해 소유 적에게 적용한다 (design .sw/enemy-gait/design.md §2·§4).
+	// 규칙 하나: 「그 분기의 목표까지 남은 거리가 문턱을 넘으면 뛴다」. 문턱은 쌍이다 -
+	//   걷는 중이면 RunEnterDistance, 뛰는 중이면 (더 짧은) RunExitDistance 를 본다(히스테리시스).
+	//   목표는 역할이 고른다 - 링 슬롯 대기면 슬롯까지, 그 밖이면 대상 사거리까지.
+	// 왜 서비스가 아니라 여기인가: 판단에 필요한 것(역할·슬롯·설정·대상)이 전부 이 컴포넌트에 이미 있다.
+	//   서비스에 두면 그 넷을 다시 모아야 하고, BTService 가 적 클래스에 직접 묶인다.
+	// 부작용: 소유 적의 CMC MaxWalkSpeed 변경(AVBEnemyBase::ApplyGait 경유).
+	void UpdateGait();
+
 	// 이 적이 지금 공격 GA 를 실제로 켤 수 있는가(쿨다운/코스트/차단태그 포함).
 	// 판정을 재구현하지 않고 엔진 정본 UGameplayAbility::CanActivateAbility 에 위임한다 -
 	//   코디네이터가 "쿨다운 중인 적에게 토큰을 주고 교착시키는" 결함을 구조적으로 없앤다.
@@ -69,6 +93,10 @@ public:
 
 	// 지금 예고(텔레그래프) 중인가. 코디네이터가 토큰 배분을 잠글 때 쓴다.
 	bool IsTelegraphing() const;
+
+	// 슈퍼아머 반격을 원하는가(design .sw/enemy-soldier/design.md §3): 아키타입에 반격 태그가 있고, 창 안에 임계만큼 맞았고,
+	//   그 GA 를 지금 켤 수 있다. 참이면 GetAttackInputTag 가 반격 태그를 돌려주고 코디네이터가 배분 1순위·숨 면제로 본다.
+	bool WantsArmoredCounter() const;
 
 	// 부팅 1회 계약 검증(서버 전용). 호출자는 AVBEnemyBase::BeginPlay 의 GiveAbility 루프 직후다.
 	// 왜 컴포넌트 BeginPlay 가 아닌가: AActor::BeginPlay 가 컴포넌트들의 BeginPlay 를 먼저 돌리고
@@ -89,14 +117,37 @@ private:
 	// State.Combat.Attacking 태그 카운트 변화 콜백. 하강 에지가 토큰 반납의 유일한 정상 지점이다.
 	void OnAttackingTagChanged(const FGameplayTag Tag, int32 NewCount);
 
+	// State.Combat.HitReacting 상승 에지 = «히트리액트가 실제로 켜진 피격» 한 대. 슈퍼아머 반격의 근거를 여기서 센다.
+	//   재트리거는 0→1 이 한 번 더 오므로 한 대 = 한 에지. 슈퍼아머로 히트리액트가 안 켜진 피격은 안 센다 - 슈퍼아머 중 피격은 근거가 아니다.
+	void OnHitReactingTagChanged(const FGameplayTag Tag, int32 NewCount);
+
+	// 창 밖 기록을 버리고 창 안 횟수를 돌려준다.
+	int32 CountRecentHits(double Now) const;
+
+	// 이 InputTag 의 스펙이 지금 켤 수 있는가(쿨다운·코스트·차단 태그). IsReadyToAttack 과 WantsArmoredCounter 가 같은 판정을 쓴다.
+	bool CanActivateAbilityByInputTag(const FGameplayTag& InputTag) const;
+
 	// 구독 해제용 ASC 재획득. BeginPlay/EndPlay 가 같은 방법으로 얻어야 핸들이 어긋나지 않는다.
 	UAbilitySystemComponent* GetOwnerASC() const;
 
 	// 내가 지금 노리는 대상. 이 컴포넌트가 소유하는 유일한 전투 사실이다.
 	TWeakObjectPtr<AActor> CombatTarget;
 
+	// 계획된 공격. INDEX_NONE / 음수 = 계획 없음. 서버 전용(토큰이 서버 사실이다).
+	int32 PlannedVariantIndex  = INDEX_NONE;
+	float PlannedStartDistance = -1.0f;
+	// 순환 커서 - 후보가 여럿일 때 같은 공격이 연달아 나오지 않게. 리셋하지 않는다(의미가 «지난번에 무엇을 썼나» 다).
+	int32 VariantPlanCursor = 0;
+
 	// ASC 태그 이벤트 구독 핸들(서버 전용). 무효면 구독하지 않았다는 뜻.
 	FDelegateHandle AttackingTagHandle;
+	FDelegateHandle HitReactingTagHandle;
+
+	// 최근 피격 시각(월드 게임시간). 창(ArmoredCounterWindowSeconds) 밖은 CountRecentHits 가 걷어낸다. 공격 시작에 비운다.
+	TArray<double> RecentHitTimes;
+
+	// HitReacting 상승 에지 판정용 래치(bWasAttacking 과 같은 이유).
+	bool bWasHitReacting = false;
 
 	// 태그 하강 에지 검출용 래치. 상승 없이 내려오는 첫 콜백(카운트 0 유지)을 무시한다.
 	bool bWasAttacking = false;

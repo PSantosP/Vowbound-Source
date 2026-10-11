@@ -20,6 +20,8 @@ class VOWBOUND_API UVBMainMenuWidget : public UVBMenuScreenWidget
 	GENERATED_BODY()
 
 public:
+	UVBMainMenuWidget(const FObjectInitializer& ObjectInitializer);
+
 	// 저장된 게임이 하나라도 있는지 → Continue/Load 버튼 활성화 판단.
 	UFUNCTION(BlueprintPure, Category="Vowbound|UI")
 	bool HasAnySaveGame() const;
@@ -48,6 +50,8 @@ public:
 	void ShowLoadPage();
 
 protected:
+	virtual bool NativeOnHandleBackAction() override;
+
 	// 로드 완료 콜백 — 성공 시 게임 레벨 오픈.
 	UFUNCTION()
 	void HandleLoadCompleted(int32 SlotIndex, bool bSuccess);

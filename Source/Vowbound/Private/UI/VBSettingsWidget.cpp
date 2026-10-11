@@ -4,9 +4,38 @@
 
 #include "SaveSystem/VBSaveGame.h"
 #include "SaveSystem/VBSaveGameSubsystem.h"
+#include "AbilitySystem/VBGameplayTags.h"
+#include "Components/Button.h"
 #include "Components/Slider.h"
 #include "Components/CheckBox.h"
+#include "UI/VBUIManagerSubsystem.h"
 #include "Vowbound/Vowbound.h"
+
+void UVBSettingsWidget::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+	if (BtnControls)
+	{
+		BtnControls->OnClicked.AddUniqueDynamic(this, &UVBSettingsWidget::HandleControlsClicked);
+	}
+	else
+	{
+		// 버튼이 없으면 키 다시 지정 화면으로 갈 길이 없다 - 조용히 빠지면 «조작이 안 보인다» 를 UI 버그로 오진한다.
+		VB_LOG(Warning, "SettingsWidget: BtnControls 미바인딩 - 키 다시 지정 화면을 열 버튼이 없다(WBP 위젯 이름 확인)");
+	}
+}
+
+void UVBSettingsWidget::HandleControlsClicked()
+{
+	if (UVBUIManagerSubsystem* UI = UVBUIManagerSubsystem::Get(this))
+	{
+		UI->PushScreen(VBGameplayTags::UI_Screen_KeyBindings);
+	}
+	else
+	{
+		VB_LOG(Warning, "SettingsWidget: UI 관리자를 못 찾았다 - 키 다시 지정 화면을 못 연다");
+	}
+}
 
 FVBSettingsSaveData UVBSettingsWidget::GetCurrentSettings() const
 {

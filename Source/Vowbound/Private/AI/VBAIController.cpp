@@ -5,7 +5,9 @@
 
 #include "Data/VBEnemyConfig.h"
 #include "Enemy/VBEnemyBase.h"
+#include "Enemy/VBEncounterGateComponent.h"
 #include "BehaviorTree/BlackboardComponent.h"
+#include "BrainComponent.h"
 #include "EngineUtils.h"                      // TActorIterator (사망 통지 순회)
 #include "Perception/AIPerceptionComponent.h"
 #include "Perception/AISenseConfig_Sight.h"
@@ -111,13 +113,84 @@ void AVBAIController::OnPossess(APawn* InPawn)
 		}
 	}
 
-	// BehaviourTree 시작
-	if (DefaultBehaviorTree)
+	// 배치에 조우 문이 있고 아직 닫혀 있으면 행동 트리를 미룬다(.sw/prologue-opening 3.2). 행동 트리가 없으면 칠판도 없어
+	//   지각이 대상을 못 적는다 - 보이지만 다가오지 않는다. 문이 열리면(OnWoken) 그때 시작한다.
+	// 앞 빙의의 구독을 먼저 푼다 - 다시 빙의하면 처리기가 겹쳐 쌓인다(f3 검증 10-07).
+	UnbindEncounterGate();
+	UVBEncounterGateComponent* Gate = InPawn->FindComponentByClass<UVBEncounterGateComponent>();
+	if (Gate)
 	{
-		RunBehaviorTree(DefaultBehaviorTree);
-		VB_LOG(Log, "AI BT 시작: %s → %s",
-		       *InPawn->GetName(), *DefaultBehaviorTree.GetName());
+		// 보류(시네마틱 장면 동안)는 깨어남과 따로 온다 - 깨어 있든 아니든 듣는다(.sw/cinematic-playback 10절 4).
+		BoundEncounterGate = Gate;
+		EncounterHeldHandle = Gate->OnHeldChanged.AddUObject(this, &AVBAIController::HandleEncounterHeldChanged);
 	}
+	if (Gate && !Gate->IsAwake())
+	{
+		EncounterWokenHandle = Gate->OnWoken.AddUObject(this, &AVBAIController::StartBehavior);
+		VB_LOG(Log, "AI BT 대기: %s - 조우 문이 닫혀 있다", *InPawn->GetName());
+		return;
+	}
+	StartBehavior();
+}
+
+void AVBAIController::OnUnPossess()
+{
+	UnbindEncounterGate();
+	Super::OnUnPossess();
+}
+
+void AVBAIController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	UnbindEncounterGate();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AVBAIController::UnbindEncounterGate()
+{
+	if (UVBEncounterGateComponent* Gate = BoundEncounterGate.Get())
+	{
+		Gate->OnHeldChanged.Remove(EncounterHeldHandle);
+		Gate->OnWoken.Remove(EncounterWokenHandle);
+	}
+	BoundEncounterGate.Reset();
+	EncounterHeldHandle.Reset();
+	EncounterWokenHandle.Reset();
+}
+
+void AVBAIController::HandleEncounterHeldChanged(bool bHeld)
+{
+	UBrainComponent* Brain = GetBrainComponent();
+	if (!Brain)
+	{
+		// 아직 행동 트리 전(깨기 전)이다. 깨어날 때 StartBehavior 가 보류를 다시 본다.
+		return;
+	}
+	// 재개는 ResumeLogic 그대로 - 보통의 재개(Continue)는 멈춘 동안 쌓인 칠판 통지를 내보낸다(BehaviorTreeComponent.cpp::ResumeLogic).
+	//   버려지는 것은 멈춘 사이 재시작이 요청된 경우(RestartedInstead)뿐이다.
+	if (bHeld)
+	{
+		Brain->PauseLogic(TEXT("EncounterHold"));
+	}
+	else
+	{
+		Brain->ResumeLogic(TEXT("EncounterHold"));
+	}
+}
+
+void AVBAIController::StartBehavior()
+{
+	if (!DefaultBehaviorTree || !GetPawn())
+	{
+		return;
+	}
+	RunBehaviorTree(DefaultBehaviorTree);
+	// 보류 중에 깨어났으면 멈춘 채 시작한다 - 장면이 끝나 보류가 풀릴 때 잇는다.
+	if (const UVBEncounterGateComponent* Gate = GetPawn()->FindComponentByClass<UVBEncounterGateComponent>(); Gate && Gate->IsHeld())
+	{
+		HandleEncounterHeldChanged(true);
+	}
+	VB_LOG(Log, "AI BT 시작: %s → %s",
+	       *GetPawn()->GetName(), *DefaultBehaviorTree.GetName());
 }
 
 void AVBAIController::OnTargetPerceptionInfoUpdated(const FActorPerceptionUpdateInfo& UpdateInfo)
@@ -197,5 +270,14 @@ void AVBAIController::NotifyActorDied(const UObject* WorldContextObject, AActor*
 	if (ClearedCount > 0)
 	{
 		VB_LOG(Log, "사망 통지: %s 를 노리던 AI %d 기의 타겟 해제", *DeadActor->GetName(), ClearedCount);
+	}
+}
+
+void AVBAIController::PushAttackStartDistance(float Distance)
+{
+	UBlackboardComponent* BB = GetBlackboardComponent();
+	if (BB && BB->IsValidKey(BB->GetKeyID(AttackRangeKeyName)))
+	{
+		BB->SetValueAsFloat(AttackRangeKeyName, Distance);
 	}
 }

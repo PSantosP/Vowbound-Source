@@ -47,4 +47,28 @@ public:
 
 	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
 	FVBPlayerBuildSaveData PlayerBuild;
+
+	// 가진 아이템(2026-09-30, .sw/narrative 10.2). append-only - 옛 슬롯은 비어 있다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBInventorySaveData Inventory;
+
+	// 퀘스트 일지(2026-10-01, .sw/narrative 12.2). append-only - 옛 슬롯은 비어 있다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBQuestSaveData Quests;
+
+	// 상점에서 판 수(2026-10-01, .sw/narrative 13.4). append-only - 옛 슬롯은 비어 있다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBShopSaveData Shops;
+
+	// 서랍장에 남은 몫(2026-10-03, .sw/narrative 14.5 W1). append-only - 옛 슬롯은 비어 있다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBLootContainerSaveData LootContainers;
+
+	// 입은 장비(2026-10-06, .sw/remaining-features/b1-equipment.md). append-only - 옛 슬롯은 비어 있다(= 아무것도 안 입음).
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBEquipmentSaveData Equipment;
+
+	// 성장 - 누적 경험치·연 스킬 칸(2026-10-07, .sw/remaining-features/b2-growth.md). append-only - 옛 슬롯은 0 / 빈 목록(= 처음 상태).
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save")
+	FVBGrowthSaveData Growth;
 };

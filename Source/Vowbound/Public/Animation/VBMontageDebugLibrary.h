@@ -1,4 +1,4 @@
-// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #pragma once
 
@@ -13,6 +13,9 @@ class UAnimMontage;
  * 진단용 — UE 5.7 python reflection 이 막은 UAnimMontage 내부(SlotAnimTracks/Notifies)를
  * C++ public 멤버/공개 API 로 읽어 execute_python_script 에서 호출 가능하게 노출.
  * 트래버설 T-pose 원인(몽타주 슬롯명) 진단에 사용.
+ *
+ * 읽기만 한다. 고치는 함수(Set*) 다섯은 2026-10-02 구조 정리 1b 에서 에디터 모듈의 UVBMontageAuthoring 으로 옮겼다 -
+ *   자산을 고치는 것은 에디터의 일이고, 여기 있던 동안 WITH_EDITOR 가드 없이 MarkPackageDirty 를 불렀다.
  */
 UCLASS()
 class VOWBOUND_API UVBMontageDebugLibrary : public UBlueprintFunctionLibrary
@@ -25,11 +28,6 @@ public:
 	//   "Debug" 카테고리지만 런타임 전투 로직에 배선됨 — 미사용 진단툴로 오인해 제거 금지.
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
 	static FName GetMontageSlotName(UAnimMontage* Montage);
-
-	// 몽타주 첫 슬롯 트랙의 슬롯명을 재저작 (DefaultSlot→UpperBody 등). 콘텐츠 툴 — python 은 SlotAnimTracks 미노출이라 C++ 경유.
-	// 반환: 성공(트랙 존재+변경) true. MarkPackageDirty 후 호출측이 에셋별 강제 save 필요(save_all only_if_dirty 스킵 트랩).
-	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
-	static bool SetMontageSlotName(UAnimMontage* Montage, FName NewSlotName);
 
 	// 몽타주 슬롯 트랙 개수.
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
@@ -55,22 +53,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
 	static FString GetMontageSegmentAnimPath(UAnimMontage* Montage);
 
-	// 빈/끊긴 montage 의 첫 슬롯 세그먼트에 anim 재연결 (RootMotion 복구). 성공 시 true.
-	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
-	static bool SetMontageSegmentAnim(UAnimMontage* Montage, UAnimSequenceBase* Anim);
-
 	// PoseSearchBranchIn notify 의 Database 참조 경로(reflection). MotionMatch 가 검색 DB 를 찾는 링크.
 	// "NULL-Database"=notify 있으나 DB 미설정, "no-BranchIn-notify"=notify 자체 없음. 정상이면 PSD 경로.
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
 	static FString GetMontageBranchInDatabasePath(UAnimMontage* Montage);
 
-	// 비어있으면 notify 없음. PoseSearchBranchIn notify 의 Database 를 지정 PSD 로 설정(reflection). 성공 시 true.
-	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
-	static bool SetMontageBranchInDatabase(UAnimMontage* Montage, UObject* Database);
-
-	// MotionWarping notify 의 RootMotionModifier.bWarpTranslation 설정(reflection). 적용된 notify 수 반환(0=notify 없음).
-	// 왜: SkewWarp 의 translation 워프는 이 플래그로 하드 게이트됨(false=위치워프 무효). 공격 접근 간격(FIND-035)에 필수.
-	//     notify 는 protected 접근이라 python 에서 못 세팅 → 이 함수 경유.
-	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug")
-	static int32 SetMontageWarpTranslation(UAnimMontage* Montage, bool bEnable);
+	// 섹션의 다음 섹션 이름. NAME_None 이면 그 섹션에서 몽타주가 멈춘다(콤보는 GA 가 명시적으로 점프한다).
+	// FCompositeSection 은 python 에 안 나와 있어 여기서 읽는다(2026-09-06, 연타 병사 몽타주 저작). 쓰는 쪽은 UVBMontageAuthoring.
+	UFUNCTION(BlueprintCallable, Category="Vowbound|Debug|Montage")
+	static FName GetMontageSectionNext(UAnimMontage* Montage, FName SectionName);
 };

@@ -4,9 +4,30 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "SaveSystem/VBSaveParticipant.h"
 #include "VBPlayerRestoreComponent.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVBOnRestoreCompleted);
+
+enum class EVBPlayerRestoreOutcome : uint8
+{
+	Unknown, InProgress, NotRequired, Completed,
+	StreamingTimedOut, GroundNotFound, StartFailed, Cancelled
+};
+
+struct FVBPlayerRestoreReceipt
+{
+	FGuid InitializationId;
+	FGuid OperationId;
+	EVBPlayerRestoreOutcome Outcome = EVBPlayerRestoreOutcome::Unknown;
+	bool bStreamingTimedOut = false;
+	bool bGroundFound = false;
+	bool IsSafeForPreparation() const
+	{
+		return Outcome == EVBPlayerRestoreOutcome::NotRequired
+			|| (Outcome == EVBPlayerRestoreOutcome::Completed && bGroundFound && !bStreamingTimedOut);
+	}
+};
 
 /**
  * UVBPlayerRestoreComponent — 저장된 위치로 플레이어를 World Partition 스트리밍-안전하게 복원한다.
@@ -23,16 +44,34 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVBOnRestoreCompleted);
  *   4. 완료되면 아래로 라인트레이스해 실제 지면 Z 를 얻어 배치.
  *   5. 동결 해제 + OnRestoreCompleted.
  *
- * 위치: 플레이어 폰(AVBCharacter)에 부착. 서버/싱글에서 GameMode 가 BeginRestore 를 호출한다.
+ * 위치: 플레이어 폰(AVBCharacter)에 부착. 위치 구역의 저장 참여자다 - 저장 때 폰 위치를 쓰고, Continue 적용 때 BeginRestore 를 스스로 부른다.
  * 부착 대상이 WP 미사용 맵이면 스트리밍 대기를 건너뛰고 지면 스냅만 수행.
  */
 UCLASS(ClassGroup=(Vowbound), meta=(BlueprintSpawnableComponent))
-class VOWBOUND_API UVBPlayerRestoreComponent : public UActorComponent
+class VOWBOUND_API UVBPlayerRestoreComponent : public UActorComponent, public IVBSaveParticipant
 {
 	GENERATED_BODY()
 
 public:
 	UVBPlayerRestoreComponent();
+
+	//~ IVBSaveParticipant - 위치 구역(Progress.SavedPlayerTransform). 문맥의 폰이 이 컴포넌트의 주인일 때만.
+	virtual void WriteSave(UVBSaveGame& Save, const FVBSaveContext& Context) override;
+	virtual void ReadSave(const UVBSaveGame& Save, const FVBSaveContext& Context) override;
+
+	void ArmInitialization(FGuid InitializationId);
+	void MarkRestoreNotRequired(FGuid InitializationId);
+	bool IsRestoring() const { return bRestoring; }
+	const FVBPlayerRestoreReceipt& GetRestoreReceipt() const { return RestoreReceipt; }
+	FSimpleMulticastDelegate OnRestoreStateChanged;
+
+protected:
+	// 등록은 BeginPlay 가 아니라 여기 - Continue 적용은 폰이 스폰된 직후, 월드 BeginPlay 전에 온다(IVBSaveParticipant 주석).
+	virtual void OnRegister() override;
+	virtual void OnUnregister() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+public:
 
 	// 저장된 Transform 으로 스트리밍-안전 복원을 시작한다. 소유 액터는 APawn(ACharacter) 이어야 한다.
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Save")
@@ -69,6 +108,16 @@ public:
 	float FallbackCapsuleHalfHeight = 88.0f;
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+	friend class FVBPlayerRestoreTestAccess;
+#endif
+	void SetRestoreOutcome(EVBPlayerRestoreOutcome Outcome);
+	void CancelRestoreReceipt();
+	FVBPlayerRestoreReceipt RestoreReceipt;
+	FGuid RunningInitializationId;
+	FGuid RunningOperationId;
+	bool bStreamingTimedOut = false;
+	bool bEnding = false;
 	// 스트리밍 완료 여부를 주기적으로 확인. 완료/타임아웃 시 지면 스냅으로 마무리.
 	void PollStreaming();
 

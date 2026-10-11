@@ -1,11 +1,14 @@
-﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 
 #include "Character/VBWeaponStateComponent.h"
 
 #include "AbilitySystem/VBAbilitySystemComponent.h"
+#include "Character/VBStartingLoadout.h"
+#include "EngineUtils.h"
 #include "AbilitySystem/VBGameplayTags.h"
 #include "Character/VBCharacter.h"
+#include "Character/VBWeaponVisualComponent.h"
 #include "Character/VBTargetable.h"
 #include "Character/VBTargetLockComponent.h"
 #include "Animation/AnimInstance.h"
@@ -23,7 +26,131 @@
 UVBWeaponStateComponent::UVBWeaponStateComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
+	bWantsInitializeComponent = true;
 	SetIsReplicatedByDefault(true);
+}
+
+void UVBWeaponStateComponent::InitializeComponent()
+{
+	Super::InitializeComponent();
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
+
+	// 시작값. 이어하기라면 곧 저장 복원(SetOwnedWeapons)이 덮는다.
+	UWorld* World = GetWorld();
+	const AVBStartingLoadout* Loadout = nullptr;
+	int32 LoadoutCount = 0;
+	if (World)
+	{
+		for (TActorIterator<AVBStartingLoadout> It(World); It; ++It)
+		{
+			Loadout = Loadout ? Loadout : *It;
+			++LoadoutCount;
+		}
+	}
+	if (LoadoutCount > 1)
+	{
+		VB_LOG(Warning, "%s: 시작 소지(AVBStartingLoadout)가 맵에 %d 개 - 첫째(%s)를 쓴다", *GetNameSafe(GetOwner()), LoadoutCount, *GetNameSafe(Loadout));
+	}
+
+	TArray<EVBWeaponType> Start;
+	if (Loadout)
+	{
+		Start = Loadout->StartingWeapons;
+	}
+	else
+	{
+		WeaponDataMap.GetKeys(Start);
+	}
+	SetOwnedWeapons(Start);
+}
+
+bool UVBWeaponStateComponent::IsWeaponOwned(EVBWeaponType InWeaponType) const
+{
+	return InWeaponType != EVBWeaponType::None && OwnedWeapons.Contains(InWeaponType);
+}
+
+EVBWeaponType VBWeaponOwnership::PickResummon(EVBWeaponType Current, EVBWeaponType LastUsed, EVBWeaponType Default, const TArray<EVBWeaponType>& Owned)
+{
+	for (const EVBWeaponType Candidate : {Current, LastUsed, Default})
+	{
+		if (Candidate != EVBWeaponType::None && Owned.Contains(Candidate))
+		{
+			return Candidate;
+		}
+	}
+	return Owned.IsEmpty() ? EVBWeaponType::None : Owned[0];
+}
+
+EVBWeaponGrantResult VBWeaponOwnership::Grant(TArray<EVBWeaponType>& Owned, const TArray<EVBWeaponType>& Known, EVBWeaponType Weapon)
+{
+	// 모르는 무기를 가진 것으로 치면 꺼낼 때 데이터가 없어 맨손 소환이 된다 - 주지 않는다.
+	if (Weapon == EVBWeaponType::None || !Known.Contains(Weapon))
+	{
+		return EVBWeaponGrantResult::Failed;
+	}
+	if (Owned.Contains(Weapon))
+	{
+		return EVBWeaponGrantResult::AlreadyOwned;
+	}
+	Owned.Add(Weapon);
+	return EVBWeaponGrantResult::NewlyOwned;
+}
+
+EVBWeaponType UVBWeaponStateComponent::GetResummonWeaponType() const
+{
+	return VBWeaponOwnership::PickResummon(CurrentWeaponType, LastUsedWeaponType, DefaultWeaponType, OwnedWeapons);
+}
+
+EVBWeaponGrantResult UVBWeaponStateComponent::GrantWeapon(EVBWeaponType InWeaponType)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		VB_LOG(Warning, "%s: 무기 주기는 서버에서만 - 클라 호출은 버린다", *GetNameSafe(GetOwner()));
+		return EVBWeaponGrantResult::Failed;
+	}
+	TArray<EVBWeaponType> Known;
+	WeaponDataMap.GetKeys(Known);
+	const EVBWeaponGrantResult Result = VBWeaponOwnership::Grant(OwnedWeapons, Known, InWeaponType);
+	switch (Result)
+	{
+	case EVBWeaponGrantResult::Failed:
+		VB_LOG(Warning, "%s: 무기 주기 실패 - WeaponDataMap 에 없는 무기(%d)", *GetNameSafe(GetOwner()), (int32)InWeaponType);
+		break;
+	case EVBWeaponGrantResult::NewlyOwned:
+		VB_LOG(Log, "%s: 무기를 새로 가졌다 - %d (가진 수 %d)", *GetNameSafe(GetOwner()), (int32)InWeaponType, OwnedWeapons.Num());
+		OnOwnedWeaponsChanged.Broadcast();
+		break;
+	case EVBWeaponGrantResult::AlreadyOwned:
+		break;
+	}
+	return Result;
+}
+
+void UVBWeaponStateComponent::SetOwnedWeapons(const TArray<EVBWeaponType>& InWeapons)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
+	OwnedWeapons.Reset();
+	for (const EVBWeaponType Type : InWeapons)
+	{
+		if (Type == EVBWeaponType::None || !WeaponDataMap.Contains(Type))
+		{
+			VB_LOG(Warning, "%s: 가진 무기 목록의 %d 는 WeaponDataMap 에 없어 버린다", *GetNameSafe(GetOwner()), (int32)Type);
+			continue;
+		}
+		OwnedWeapons.AddUnique(Type);
+	}
+	OnOwnedWeaponsChanged.Broadcast();
+}
+
+void UVBWeaponStateComponent::OnRep_OwnedWeapons()
+{
+	OnOwnedWeaponsChanged.Broadcast();
 }
 
 const UVBWeaponStateConfig* UVBWeaponStateComponent::GetWeaponStateConfig() const
@@ -151,6 +278,8 @@ void UVBWeaponStateComponent::GetLifetimeReplicatedProps(TArray<class FLifetimeP
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME_CONDITION_NOTIFY(UVBWeaponStateComponent, LocomotionState, COND_None, REPNOTIFY_Always);
 	DOREPLIFETIME_CONDITION_NOTIFY(UVBWeaponStateComponent, CurrentWeaponType, COND_None, REPNOTIFY_Always);
+	DOREPLIFETIME_CONDITION_NOTIFY(UVBWeaponStateComponent, bIsTempSheathed, COND_None, REPNOTIFY_Always);
+	DOREPLIFETIME_CONDITION(UVBWeaponStateComponent, OwnedWeapons, COND_OwnerOnly);
 }
 
 void UVBWeaponStateComponent::ServerSheatheWeapon_Implementation()
@@ -171,10 +300,10 @@ void UVBWeaponStateComponent::ServerSheatheWeapon_Implementation()
 	// 납도 연기용 — 상태 변경 전 캡처 (From = 손에 들려 있던 무기, DEC-006 ⑥ 규약)
 	const EVBWeaponType FromType = CurrentWeaponType;
 
-	// 납도 = 무기만 Off, 전투는 유지 (DEC-006 ② user 확정: ArmedCombat → ArmedExploration).
+	// 납도 = 무기만 Off, 전투는 유지 (DEC-006 ② user 확정: ArmedCombat → CombatSheathed).
 	// CurrentWeaponType 은 "선택된 무기" 기억으로 유지 — 재발도/공격 자동발도가 같은 무기를 꺼낸다.
 	// 태그 제거는 SetLocomotionState 의 AC 이탈 규칙이, 전투 이탈은 TryCombatExit 타이머가 담당.
-	SetLocomotionState(EVBLocomotionState::ArmedExploration);
+	SetLocomotionState(EVBLocomotionState::CombatSheathed);
 
 	// 납도 연기 (FIND-022) — SheatheMontage 콘텐츠 부재 무기는 소환 VFX만 발사됨
 	MulticastPlayWeaponChangeActing(FromType, EVBWeaponType::None, /*bCombatStance=*/true);
@@ -199,7 +328,15 @@ void UVBWeaponStateComponent::ServerSummonWeapon_Implementation(EVBWeaponType In
 	{
 		return;
 	}
-	
+
+	// 가진 무기만 꺼낸다(.sw/prologue-opening 3.1). 여기가 Tab·슬롯 키·공격 자동 발도·이어하기 복원이 모두 지나는 관문이다.
+	//   막힌 요청은 상태를 하나도 바꾸지 않는다 - 연기·태그·전투 타이머 전부 그대로.
+	if (!IsWeaponOwned(InWeaponType))
+	{
+		VB_LOG(Log, "ServerSummonWeapon : 가지지 않은 무기(%d) - 꺼내지 않는다", (int32)InWeaponType);
+		return;
+	}
+
 	VB_LOG(Log, "ServerSummonWeapon : RequestType=%d, CurrentType=%d",
 		(int32)InWeaponType, (int32)CurrentWeaponType);
 
@@ -264,6 +401,9 @@ void UVBWeaponStateComponent::MulticastPlayWeaponChangeActing_Implementation(EVB
 	if (GetNetMode() == NM_DedicatedServer) return;
 	if (!OwnerCharacter.IsValid() || !OwnerCharacter->GetMesh()) return;
 
+	UVBWeaponVisualComponent* WeaponVisual = OwnerCharacter->FindComponentByClass<UVBWeaponVisualComponent>();
+	if (WeaponVisual) WeaponVisual->BeginWeaponTransition(ToType, nullptr, nullptr);
+
 	// To=None(수납)이면 From 무기 데이터를 사용 — 수납 연기/VFX는 사라지는 무기 소속.
 	const EVBWeaponType DataKey = (ToType != EVBWeaponType::None) ? ToType : FromType;
 	const FVBWeaponSummonData* Data = WeaponDataMap.Find(DataKey);
@@ -319,7 +459,11 @@ void UVBWeaponStateComponent::MulticastPlayWeaponChangeActing_Implementation(EVB
 	if (UAnimInstance* AnimInst = OwnerCharacter->GetMesh()->GetAnimInstance())
 	{
 		// 슬롯은 에셋 baked(UpperBody or DefaultSlot). 둘 다 DefaultGroup 이라 공격/회피가 자연 인터럽트(dodge cancel 보존).
-		AnimInst->Montage_Play(Montage);
+		const float PlayedLength = AnimInst->Montage_Play(Montage);
+		if (WeaponVisual && PlayedLength > 0.0f)
+		{
+			WeaponVisual->BeginWeaponTransition(ToType, AnimInst, Montage);
+		}
 		VB_LOG(Log, "WeaponChangeActing: montage=%s from=%d to=%d combat=%d upperBody=%d",
 		       *Montage->GetName(), (int32)FromType, (int32)ToType, bCombatStance ? 1 : 0, bUpperBody ? 1 : 0);
 	}
@@ -327,13 +471,13 @@ void UVBWeaponStateComponent::MulticastPlayWeaponChangeActing_Implementation(EVB
 
 void UVBWeaponStateComponent::ServerEnterCombat_Implementation()
 {
-	VB_LOG(Log, "ServerEnterCombat : CurrentState=%d", (int32)LocomotionState);
-
 	// 전투 자극 (DEC-006 ①): 자동 발도 없음 — 평상이면 전투·무기Off(상태2)로 직행.
 	// 발도는 명시 행위(Tab/슬롯키) 또는 공격 GA 의 EnsureWeaponSummoned(③)만 한다.
+	// 로그는 상태가 실제로 바뀔 때만 (2026-09-06): 자극은 전투 중 매 틱 오므로 매 호출 로그가 18ms 마다 찍혀 다른 계측을 덮었다.
 	if (LocomotionState == EVBLocomotionState::Unarmed)
 	{
-		SetLocomotionState(EVBLocomotionState::ArmedExploration);
+		VB_LOG(Log, "ServerEnterCombat : Unarmed -> CombatSheathed");
+		SetLocomotionState(EVBLocomotionState::CombatSheathed);
 	}
 	else
 	{
@@ -468,6 +612,13 @@ bool UVBWeaponStateComponent::AreEnemiesNearby() const
 	return false;
 }
 
+const TArray<TObjectPtr<UVBFinisherConfig>>* UVBWeaponStateComponent::GetFinisherConfigs() const
+{
+	// 조회 키는 CurrentWeaponType 이다 - 처형은 무기를 든 상태에서만 걸리므로 「선택된 무기」가 곧 「든 무기」다.
+	const FVBWeaponSummonData* Data = WeaponDataMap.Find(CurrentWeaponType);
+	return Data ? &Data->FinisherConfigs : nullptr;
+}
+
 EVBWeaponType UVBWeaponStateComponent::GetMMPoolForState(EVBLocomotionState InState) const
 {
 	// 미등록 무기는 기본 풀이다. 경고하지 않는 이유: 맨손(None)이 정상 경로로 여기 들어오고,
@@ -482,7 +633,7 @@ EVBWeaponType UVBWeaponStateComponent::GetMMPoolForState(EVBLocomotionState InSt
 	switch (InState)
 	{
 	case EVBLocomotionState::ArmedCombat:      return Data->ArmedMMPool;
-	case EVBLocomotionState::ArmedExploration: return Data->SheathedMMPool;
+	case EVBLocomotionState::CombatSheathed: return Data->SheathedMMPool;
 	default:                                   return EVBWeaponType::None; // 평상(무기 없음)
 	}
 }

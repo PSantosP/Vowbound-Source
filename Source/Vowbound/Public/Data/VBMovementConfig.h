@@ -3,7 +3,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Character/VBWeaponStateTypes.h" // EVBWeaponType (WeaponProfileOverrides 키)
+#include "Types/VBWeaponStateTypes.h" // EVBWeaponType (WeaponProfileOverrides 키)
+#include "Types/VBSlideMovementSettings.h"
 #include "Engine/DataAsset.h"
 #include "VBMovementConfig.generated.h"
 
@@ -11,7 +12,7 @@
  * 한 (무기/상태) 조합의 속도 프로파일. X=Forward Y=Strafe Z=Backward.
  * UpdateMaxSpeed() 가 velocity-각도 zone(0/1/2) 으로 X/Y/Z 사이 lerp 하여 CMC->MaxWalkSpeed 갱신.
  * 특례 소거의 핵심: 무기별 속도를 필드가 아니라 프로파일(데이터)로 둔다 — BigSword override 추가/삭제에 C++ 무변경.
- * 인라인 디폴트 = Armed(Fighter/Katana/Magic) 값. Unarmed/BigSword 는 config 생성자에서 명시 초기화(VBMovementConfig.cpp).
+ * 인라인 디폴트 = Armed(Fighter/Magic) 값. Unarmed/Katana/BigSword 는 config 생성자에서 명시 초기화(VBMovementConfig.cpp).
  */
 USTRUCT(BlueprintType)
 struct FVBMovementProfile
@@ -22,15 +23,23 @@ struct FVBMovementProfile
 	FVector WalkSpeeds = FVector(165.f, 165.f, 165.f);
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion", meta=(ToolTip="기본 순항 jog(8-way strafe)"))
-	FVector RunSpeeds = FVector(430.f, 430.f, 430.f);
+	FVector RunSpeeds = FVector(250.f, 235.f, 225.f);
+
+	// 45/135도 대각선 jog 클립의 루트 이동 속도. 축 방향 속도 사이를 단순 보간하면 대각선이 과속한다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion", meta=(ClampMin="0"))
+	float RunDiagonalSpeed = 225.f;
 
 	// Sprint 1단계(홀드 0~SprintRampDuration). bSprintRampEnabled=false 인 프로파일은 sprint 시 항상 이 값.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
-	FVector SprintRunSpeeds = FVector(585.f, 585.f, 585.f);
+	FVector SprintRunSpeeds = FVector(550.f, 550.f, 550.f);
 
 	// Sprint 2단계(홀드 ≥ SprintRampDuration). bSprintRampEnabled=true 일 때만 도달.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
-	FVector SprintSpeeds = FVector(1100.f, 1100.f, 1100.f);
+	FVector SprintSpeeds = FVector(640.f, 640.f, 640.f);
+
+	// Sprint 해제 후 고속 풀을 유지할 하한. Dense Chooser의 해당 무기 Sprint 행 Min과 일치해야 한다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion", meta=(ClampMin="0"))
+	float SprintPoolJoinSpeed = 500.f;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
 	float CrouchSpeed = 165.f;
@@ -98,20 +107,42 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
 	float SprintRampDuration = 0.6f;
 
+	// Sprint+Crouch slide. CMC walking physics keeps floor/collision/crouch prediction active.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide")
+	float SlideStartSpeed = 380.f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide")
+	float SlideEndSpeed = 200.f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide")
+	float SlideMaxDuration = 0.f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide")
+	FVBSlideMovementSettings SlideSettings;
+	// 질주 키를 쥔 채 슬라이드가 끝났을 때 슬라이드 그래프의 «달려 나오기»(조깅 속도 클립, 약 2.3초)를 보이는 최소 시간(초). 지나고 본 이동 그래프가
+	//   «서서 Locomotion Loop» 에 들어가 있으면 그 그래프가 질주 풀로 이어 받는다(UVBAnimInstance::NativeUpdateAnimation). 끝까지 보이면 질주 속도로 가속하는 동안 조깅 다리가 남아 «Jog 로 된다» 로 보였다(user 10-07, 01 진단 10-08).
+	//   너무 짧으면 앉은 포즈에서 질주로 팝이 난다. 질주를 안 쥔 슬라이드에는 쓰지 않는다. 설계 .sw/slide-sprint-resume/fix-design-claude.md.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide", meta=(ClampMin="0", Units="s"))
+	float SlideSprintExitHandoff = 0.25f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Slide")
+	float SlideMaxSpeed = 800.f;
+
 	// ── 속도 프로파일(base + override) ──
 	// 비무장 base. config 생성자에서 (200,175,150)/(500,350,300)/650/150/ramp off 로 초기화.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
 	FVBMovementProfile UnarmedProfile;
 
-	// 무장 base(Fighter/Katana/Magic). struct 인라인 디폴트(165/430/585/1100/165/ramp on) 그대로.
+	// 무장 base(Fighter/Magic). jog 8-way 루트 속도와 Run/Sprint 클립에 맞춘 기본값.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
 	FVBMovementProfile ArmedDefaultProfile;
 
-	// 무기별 오버라이드(미등록 = ArmedDefault base). 현재 BigSword(Run 270, ramp off) 1건.
+	// 무기별 오버라이드(미등록 = ArmedDefault base). Katana/BigSword 는 전용 클립 속도에 맞춘다.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Locomotion")
 	TMap<EVBWeaponType, FVBMovementProfile> WeaponProfileOverrides;
 
 	// 무기타입·무장여부로 프로파일 해석. !bArmed=Unarmed / bArmed & override 있음=override / 그 외=ArmedDefault.
 	// 미등록 무기는 ArmedDefault 폴백(회귀 안전 — HitReact::ResolveMontage / Moveset::GetAttackConfig 동형).
 	const FVBMovementProfile& ResolveProfile(EVBWeaponType WeaponType, bool bArmed) const;
+
+#if WITH_EDITOR
+	// 슬라이드 끝 속도가 시작 속도보다 작아야 한다 - 같거나 크면 시작한 그 프레임에 끝난다(f3 verify 47c1e578).
+	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
+#endif
 };

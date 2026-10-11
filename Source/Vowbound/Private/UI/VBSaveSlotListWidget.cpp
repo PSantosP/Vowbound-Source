@@ -136,11 +136,24 @@ void UVBSaveSlotListWidget::SelectSlot(int32 SlotIndex)
 
 	case EVBSlotListMode::Save:
 		// 저장은 레벨을 열지 않는다 - 이미 플레이 중이고 메뉴만 닫으면 된다.
-		// 구독을 저장 성공 뒤에 거는 이유: 폰 null/범위 밖이면 완료 통지가 영영 오지 않아 구독이 남는다.
-		// 비동기 완료 콜백은 빨라야 다음 틱이므로, 이 사이에 끼어들어 놓치는 일은 없다.
-		if (Subsystem->SaveCurrentGameToSlot(GetOwningPlayerPawn(), SlotIndex))
+		// 구독을 «먼저» 건다. 엔진 UGameplayStatics::AsyncSaveGameToSlot 은 저장 백엔드가 없거나 직렬화가 실패하면
+		//   완료 통지(false)를 함수 안에서 바로 보낸다(else 갈래) - 부른 뒤에 구독하면 그 실패를 놓치고 구독만 남아
+		//   다음 별개의 저장 완료에 이 화면이 반응한다(2026-10-03 Codex 02 지적, 엔진 소스 확인. 종전 주석의 «빨라야 다음 틱» 은 성공 갈래만 맞았다).
+		//   요청 자체가 거절되면(폰 없음·슬롯 범위 밖·참여자 없음 = false) 통지가 오지 않으므로 이 요청의 대기를 거둔다.
+		// 대기는 한 칸이고 마지막 요청이 이긴다 - 앞 저장이 끝나기 전에 다른 슬롯을 누르면 앞 완료는 무시되고(목록 다시 짓기는 뒤 완료가 전부 덮는다),
+		//   뒤 요청이 거절되면 앞 대기로 되돌린다(앞 완료까지 놓치지 않게). 두 번째 저장을 막는 안은 버렸다 - 완료가 끝내 안 오면 화면이 영영 저장을 거절한다.
 		{
-			Subsystem->OnGameSaveCompleted.AddDynamic(this, &UVBSaveSlotListWidget::HandleSaveCompleted);
+			const int32 PreviousPending = PendingSaveSlot;
+			PendingSaveSlot = SlotIndex;
+			Subsystem->OnGameSaveCompleted.AddUniqueDynamic(this, &UVBSaveSlotListWidget::HandleSaveCompleted);
+			if (!Subsystem->SaveCurrentGameToSlot(GetOwningPlayerPawn(), SlotIndex))
+			{
+				PendingSaveSlot = PreviousPending;
+				if (PendingSaveSlot == INDEX_NONE)
+				{
+					Subsystem->OnGameSaveCompleted.RemoveDynamic(this, &UVBSaveSlotListWidget::HandleSaveCompleted);
+				}
+			}
 		}
 		return;
 
@@ -168,6 +181,12 @@ void UVBSaveSlotListWidget::DeleteSlot(int32 SlotIndex)
 
 void UVBSaveSlotListWidget::HandleSaveCompleted(int32 SlotIndex, bool bSuccess)
 {
+	// 다른 슬롯의 완료(다른 길이 쓴 저장)는 내 것이 아니다 - 구독을 유지한 채 기다린다.
+	if (SlotIndex != PendingSaveSlot)
+	{
+		return;
+	}
+	PendingSaveSlot = INDEX_NONE;
 	if (UVBSaveGameSubsystem* Subsystem = UVBSaveGameSubsystem::Get(this))
 	{
 		Subsystem->OnGameSaveCompleted.RemoveDynamic(this, &UVBSaveSlotListWidget::HandleSaveCompleted);

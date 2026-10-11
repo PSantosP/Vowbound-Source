@@ -5,15 +5,19 @@
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/VBAnimationTypes.h"
-#include "Character/VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "Curves/CurveFloat.h"
 #include "CharacterTrajectoryComponent.h"
 #include "AnimationWarpingTypes.h"
 #include "BoneControllers/AnimNode_OrientationWarping.h" // EOrientationWarpingSpace enum (RootBoneTransform/ComponentTransform/CustomTransform)
 #include "GameplayTagContainer.h"
 #include "PoseSearch/PoseSearchLibrary.h"
+#include "Animation/VBInteractionAnimInterface.h"
+#include "Animation/VBInteractionIK.h"
 #include "PoseSearch/PoseSearchTrajectoryLibrary.h"
 #include "PoseSearch/PoseSearchTrajectoryTypes.h"
+#include "CharacterCommon/VBRagdollComponent.h"
+#include "Animation/VBGASPNotifyInterface.h"
 #include "BoneControllers/AnimNode_OffsetRootBone.h"
 #include "VBAnimInstance.generated.h"
 
@@ -55,20 +59,90 @@ struct FVBTIPMontageSet
  * AVBCharacter일 경우에만 추가 변수(전투모드, 스프린트)를 업데이트
  */
 UCLASS()
-class VOWBOUND_API UVBAnimInstance : public UAnimInstance
+class VOWBOUND_API UVBAnimInstance : public UAnimInstance, public IVBInteractionAnimInterface, public IVBGASPNotifyInterface
 {
 	GENERATED_BODY()
 public:
 	virtual void NativeInitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
 	virtual void NativePostEvaluateAnimation() override;
+	// 공격 루트모션은 실제 이동으로 유지하되 무입력 복귀 포즈의 주행 의도로 쓰지 않는다.
+	static bool ShouldSuppressAttackLocomotion(const ACharacter* Character);
+	bool IsSuppressingAttackLocomotion() const { return bSuppressAttackLocomotion; }
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Ragdoll")
+	FVBRagdollAnimationState RagdollState;
+	UFUNCTION(BlueprintPure, Category="Vowbound|Ragdoll", meta=(BlueprintThreadSafe))
+	double GetRagdollElapsedTime() const { return RagdollState.ElapsedSeconds; }
+	UFUNCTION(BlueprintPure, Category="Vowbound|Ragdoll", meta=(BlueprintThreadSafe))
+	bool IsPoweredRagdollPose() const { return RagdollState.bPowered; }
+	UFUNCTION(BlueprintPure, Category="Vowbound|Ragdoll", meta=(BlueprintThreadSafe))
+	bool IsNotPoweredRagdollPose() const { return !RagdollState.bPowered; }
+	virtual EVBGait GetGASPNotifyGait_Implementation() const override { return Gait; }
+	EVBGait GetCurrentGait() const { return Gait; }
+	virtual void RequestGASPEarlyTransition_Implementation(bool bToLoop) override;
+
+	// The linked GASP graph owns base locomotion, root offset and turn selection.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|GASP")
+	bool bUseGASPLocomotion = false;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|GASP|FootPlacement", meta=(ClampMin="1.0", Units="cm"))
+	float FootPlacementPelvisMaxOffset = 15.f;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|GASP|FootPlacement", meta=(ClampMin="1.0"))
+	float FootPlacementPelvisStiffness = 10000.f;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Vowbound|GASP")
+	bool bUseGASPSlidePose = false;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Vowbound|GASP")
+	bool bUseOriginalGASPUnarmed = true;
+
+	bool bGASPSlideEntered = false;
+
+	// 물리 슬라이드가 끝난 뒤 슬라이드 포즈를 계속 쓴 시간(초). 질주 키를 쥐었으면 UVBMovementConfig::SlideSprintExitHandoff 에서 본 그래프로 넘긴다.
+	float SlideExitElapsed = 0.f;
+
+	// 슬라이드 그래프 없이 미끄러질 때 경고를 한 번만 낸다.
+	bool bWarnedMissingSlideGraph = false;
+
+	// 질주 인계가 본 그래프의 이름표(Stance=Stand·Locomotion Loop)를 처음 따질 때 «있기는 한가» 를 한 번만 본다(없으면 경고 한 번).
+	bool bSprintHandoffNamesChecked = false;
+
+	bool UsesWeaponLocomotion() const { return LocomotionState != EVBLocomotionState::Unarmed; }
+	bool ShouldReleaseGASPRootOffset() const { return bReleaseGASPRootOffset; }
+
+	// 가드 유지 구간에 전용 가드 Idle/Turn 선택이 성공한 뒤 하체를 사용한다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|GASP|Guard")
+	bool bEnableGuardTurnPose = false;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Vowbound|GASP|Guard")
+	bool bUseGuardLocomotionPose = false;
+
+	bool CanUseGuardLocomotionPose() const;
+	UChooserTable* GetRequestedGuardLocomotionChooser() const;
+
+	UPROPERTY(Transient)
+	bool bReleaseGASPRootOffset = false;
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|GASP", meta=(BlueprintThreadSafe))
+	UAnimInstance* GetGASPLocomotionInstance() const { return GASPLocomotionInstance; }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|GASP", meta=(BlueprintThreadSafe))
+	UAnimInstance* GetGASPNotifyInstance() const { return bUseGASPSlidePose ? GASPSlideInstance : GASPLocomotionInstance; }
+
+	UPROPERTY(Transient)
+	TObjectPtr<UAnimInstance> GASPSlideInstance;
+
+	// Refreshed on the game thread before either graph runs its worker-thread update.
+	UPROPERTY(Transient)
+	TObjectPtr<UAnimInstance> GASPLocomotionInstance;
 
 	// 트래버설 front-ledge world transform (TryTraversalAction Step5.2 가 C++ 에서 직접 설정).
 	// PSC_Traversal_Pos/Head 채널은 AnimInstance 를 GASP BP 인터페이스 BPI_InteractionTransform 으로 캐스트해
-	//   GetInteractionTransform 으로 이 값을 읽는다(PSC_Traversal_Pos::BP_GetWorldPosition graph 검증). C++ 는 BP
-	//   인터페이스를 구현 못 하므로 ABP_VBCharacter(BP child)가 BPI 를 구현하고 이 변수를 반환/저장해야 채널 cast 성공.
-	//   (구현 안 되면 cast 실패 → attach 쿼리=0 → 음수축(-X/-Y) normal 접근 시 MotionMatch selDB=0.)
-	//   BlueprintReadWrite: C++ 가 set, ABP BPI::Get 이 read (+필요시 BPI::Set 이 write).
+	// GetInteractionTransform 으로 이 값을 읽는다(PSC_Traversal_Pos::BP_GetWorldPosition graph 검증). C++ 는 BP
+	// 인터페이스를 구현 못 하므로 ABP_VBCharacter(BP child)가 BPI 를 구현하고 이 변수를 반환/저장해야 채널 cast 성공.
+	// (구현 안 되면 cast 실패 → attach 쿼리=0 → 음수축(-X/-Y) normal 접근 시 MotionMatch selDB=0.)
+	// BlueprintReadWrite: C++ 가 set, ABP BPI::Get 이 read (+필요시 BPI::Set 이 write).
 	UPROPERTY(BlueprintReadWrite, Category="Vowbound|Animation|MotionMatching")
 	FTransform InteractionTransform = FTransform::Identity;
 
@@ -89,6 +163,16 @@ public:
 	// 그 외(정지/공중) Release.
 	UFUNCTION(BlueprintPure, Category="Vowbound|Animation|MotionMatching", meta=(BlueprintThreadSafe))
 	EOffsetRootBoneMode GetOffsetRootTranslationMode() const;
+
+	// 트래버설 컴포넌트가 캡슐 위치의 주인인가. OffsetRootBone 의 두 모드 판정이 이것을 본다.
+	//   술어를 한 곳에 두는 이유: 같은 뜻을 세 군데에 적었다가 한 곳을 빠뜨리면 위치는 놓는데 회전은
+	//   안 놓는 식으로 갈린다. 실제로 그 셋 중 하나(UpdatePoseOverrideState 의 멤버 대입)는 죽어 있었다.
+	bool IsTraversalOwningPose() const { return bIsHanging || bIsClimbing || bIsOnLadder; }
+
+	// 사다리에 붙어 있나. UpdatePoseOverrideState 가 트래버설 컴포넌트를 미러한다.
+	//   자세는 몽타주가 쥐므로 ABP 에 새 분기를 안 만든다 - 등반의 몽타주 경로와 같은 자리를 쓴다.
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Traversal")
+	bool bIsOnLadder = false;
 
 	// OffsetRootBone.RotationMode pin binding — GASP 로직:
 	// DefaultSlot 재생 중이면 Release, 아니면 Accumulate(회전 누적).
@@ -113,6 +197,8 @@ public:
 	// GASP ShouldTurnInPlace — 정지 상태에서 Desired Controller Yaw 변화가 큼. TIP DB 선택.
 	UFUNCTION(BlueprintPure, Category="Vowbound|Animation|MotionMatching", meta=(BlueprintThreadSafe))
 	bool ShouldTurnInPlace() const;
+	/** Capture on the game thread; linked CMC must retain the montage's TIP ownership. */
+	bool DoesTurnProfileOwnTIP() const { return bTurnProfileOwnsTIP; }
 
 	// GASP ShouldSpinTransition — 정지 → 이동 시작 시 현재 mesh 방향과 목표 방향 차이가 큼. SpinTransition 선택.
 	UFUNCTION(BlueprintPure, Category="Vowbound|Animation|MotionMatching", meta=(BlueprintThreadSafe))
@@ -255,12 +341,96 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|MotionMatching")
 	TObjectPtr<class UChooserTable> MasterChooserTable;
 
+	// === 처형 상호작용 (GASP 5.8 Pose Search Interaction) ===
+
+	// 처형 chooser. 오브젝트 컨텍스트 = 이 AnimInstance. 출력 = 후보 PSD 들.
+	// 공격자 쪽만 쓴다 - 짝을 짓는 쪽이 검색을 돌리고 피해자는 자기 AnimInstance 만 빌려준다.
+	// 비어 있으면 새 경로를 통째로 건너뛴다 = 지금까지의 처형 경로 그대로다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Finisher")
+	TObjectPtr<class UChooserTable> FinisherChooserTable;
+
+	// 이 ABP 의 Pose History 노드 이름. MotionMatchMulti 가 뼈·궤적을 그 노드에서 읽는다.
+	// 이름이 틀리면 조용히 결과가 안 온다(에러가 아니다) - 그래서 값으로 꺼내 두고 로그로 밝힌다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Finisher")
+	FName InteractionPoseHistoryName = FName("PoseHistory");
+
+public:
+	// IVBInteractionAnimInterface — 「누가 채우고 누가 읽는가」는 그 헤더 한 곳에 있다.
+	virtual const FPoseSearchBlueprintResult& GetInteractionResult() const override { return InteractionResult; }
+	virtual void SetInteractionResult(const FPoseSearchBlueprintResult& InResult) override { InteractionResult = InResult; }
+
+	/** MotionMatchMulti 에 넘길 Pose History 노드 이름. */
+	FName GetInteractionPoseHistoryName() const { return InteractionPoseHistoryName; }
+
+	// 상호작용 손 IK. AnimGraph 의 IK 노드가 이 값을 핀으로 읽는다.
+	//   채우는 것은 UVBInteractionIKLibrary 하나뿐이다 - 「왜」는 그 헤더에 있다.
+	UPROPERTY(BlueprintReadOnly, EditDefaultsOnly, Category="Vowbound|Finisher")
+	FVBInteractionIKRuntime InteractionIK;
+
+	// 원본 FullBodyIK Control Rig 에 위치와 회전을 같은 컴포넌트 공간으로 전달한다.
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	FTransform GetInteractionIKLeftTarget() const { return InteractionIK.Left.Target; }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	FTransform GetInteractionIKRightTarget() const { return InteractionIK.Right.Target; }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	bool IsInteractionIKEnabled() const { return InteractionIK.bEnabled; }
+
+	// === 상호작용 손 IK 의 AnimGraph 접점 ===
+	//
+	// 왜 함수인가: 애님그래프 핀 바인딩은 변수를 안 받고 함수만 받는다(tool-traps, 2026-07-29).
+	//   구조체 멤버 경로(InteractionIK.Left.Alpha)를 핀에 직접 물릴 수 없어서 넷을 낸다.
+	// 왜 BlueprintThreadSafe 인가: 핀 바인딩은 애니메이션 워커 스레드에서 불린다. 멤버만 읽는다.
+	// TwoBoneIK 의 EffectorLocation 은 FVector 라 위치만 넘긴다 - 회전은 노드의
+	//   bTakeRotationFromEffectorSpace 가 든다.
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	FVector GetInteractionIKLeftEffector() const { return InteractionIK.Left.Target.GetLocation(); }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	float GetInteractionIKLeftAlpha() const { return InteractionIK.bEnabled ? InteractionIK.Left.Alpha : 0.0f; }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	FVector GetInteractionIKRightEffector() const { return InteractionIK.Right.Target.GetLocation(); }
+
+	UFUNCTION(BlueprintPure, Category="Vowbound|Finisher", meta=(BlueprintThreadSafe))
+	float GetInteractionIKRightAlpha() const { return InteractionIK.bEnabled ? InteractionIK.Right.Alpha : 0.0f; }
+
+
+	/**
+	 * 처형 chooser 를 평가해 이번에 검색할 PSD 후보들을 낸다. 미배선·무후보면 빈 배열.
+	 *
+	 * 왜 여기인가: chooser 컨텍스트가 이 클래스 자신이다. 무기는 CurrentWeaponType, 속도는 Speed2D 로
+	 *   이미 매 틱 갱신되고 있어서 전용 입력 구조체를 만들 이유가 없다(VBFinisherConfig.h 의 그 자리 주석).
+	 * 부르는 쪽은 공격자의 UVBFinisherComponent 하나다.
+	 */
+	void EvaluateFinisherDatabases(TArray<UPoseSearchDatabase*>& OutDatabases) const;
+
+private:
+	bool bSuppressAttackLocomotion = false;
+	// 가드 선택기 진입 때만 실제 BlendStack 혼합 완료를 기다린다.
+	TWeakObjectPtr<UChooserTable> GuardBlendReadyChooser;
+	friend class FVBCombatAnimationRecoveryTest;
+	// UPROPERTY 가 필수인 이유는 IVBInteractionAnimInterface 헤더에 적혀 있다(GC 가 SelectedAnim 을 가져간다).
+	UPROPERTY(Transient)
+	FPoseSearchBlueprintResult InteractionResult;
+
+	// 접근 지정자를 원래대로 되돌린다. 이 아래는 본래 public 구역이었고
+	//   GetCurrentSelectedDatabase 가 거기 산다. 2026-09-19 에 위 private 을 넣으면서
+	//   그 함수까지 private 으로 밀려 VBCharacter.cpp 가 컴파일 실패했다 -
+	//   기존 구역 한가운데에 접근 지정자를 넣을 때는 끝을 반드시 복원해야 한다.
+public:
+
 	// 궤적 샘플링 파라미터(History/Prediction 간격·개수)는 여기 없다. 값은 UpdateTrajectory 의
 	// PoseSearchGenerateTransformTrajectory 호출 인자 리터럴이 유일한 홈이다 — 이유는 그 호출부 주석 참조.
 
 	// GASP GenerateTrajectory 의 last-update yaw 추적 필드 — PoseSearchGenerateTransformTrajectory 가 ref 로 수정.
 	// PreviousDesiredControllerYaw 와 별도 — 엔진 API 용 internal state.
 	float DesiredControllerYawLastUpdate = 0.0f;
+
+	// 지금 모션매칭이 고른 데이터베이스. 진단 전용 - 「어느 풀에서 골랐나」(Idles / Loops / Stops)를
+	// 밖에서 물을 수 있어야 «왜 정지 클립이 나오나» 를 가를 수 있다(2026-09-07 카타나 3타 건).
+	const UPoseSearchDatabase* GetCurrentSelectedDatabase() const { return CurrentSelectedDatabase; }
 
 protected:
 
@@ -296,8 +466,8 @@ protected:
 
 	// DEBT-006 Phase A: 무장 '이동 중' 턴-래그 (캡슐 요 델타 흡수-감쇠 스프링).
 	// 왜: 무장 분기는 velocity 구동 인플레이스 8-way BS 라 카메라 턴이 통짜 회전으로 보임 —
-	//   요 델타를 흡수했다가 감쇠시켜 OrientationWarping(Manual)에 공급하면 하체가 진행 방향을
-	//   잠깐 유지하고 상체가 먼저 도는 끌림을 연기한다. idle 턴은 TIP 전담이므로 이동 중에만 누적.
+	// 요 델타를 흡수했다가 감쇠시켜 OrientationWarping(Manual)에 공급하면 하체가 진행 방향을
+	// 잠깐 유지하고 상체가 먼저 도는 끌림을 연기한다. idle 턴은 TIP 전담이므로 이동 중에만 누적.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	float ArmedTurnLagYaw = 0.0f;
 
@@ -410,40 +580,32 @@ protected:
 	// 비무장500→무장350 감속 과도기에 첫 검색이 옛 속도 정합 클립(Fighter_Run_Root 549)을 골랐다가
 	// 수렴 후 jog 로 재선택 — 두 번 갈아타는 블립. 래치해 뒀다가 |Speed2D−MaxWalkSpeed| 수렴(또는 저속/
 	// 타임아웃) 시 발화하면 보폭 동일 스왑(K↔F)은 즉시, 발도/납도는 이전 풀이 감속을 자연 연기 후 1회 전환.
-	bool  bPendingPoolInterrupt = false;   // 래치 (game thread 전용)
+	bool bPendingPoolInterrupt = false; // 래치 (game thread 전용)
 	float PoolInterruptPendingTime = 0.0f; // 래치 경과(초) — 타임아웃 보장
 	// 발도↔납도 풀 스왑 감지 (FIND-030, user FEEL 07-05 "걸으면서 Tab 하면 바로 안 바뀜"). BigSword 는
 	// 상태2(납도)=Sheathed 풀 / 상태3(발도)=Stand 풀 로 CHT 가 갈리지만 두 상태 모두 MMWeaponType=BigSword 라
 	// 위 MMWeaponType 래치가 안 걸린다 → continuing pose 잔존으로 전환 지연. 전 프레임 sheathed 여부와 비교해
 	// 변화 시 즉시 interrupt (보폭 동일 무장 gait 스왑이라 정착 대기 불필요).
-	bool  bMMPoolSheathed_LastFrame = false; // 게임 스레드 전용
+	bool bMMPoolSheathed_LastFrame = false; // 게임 스레드 전용
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation|MotionMatching")
-	bool  bFirePoolInterrupt = false;      // 이번 프레임 발화 — GetMMInterruptMode(worker) 소비
+	bool bFirePoolInterrupt = false; // 이번 프레임 발화 — GetMMInterruptMode(worker) 소비
 
 	// Sprint 풀 합류 자격 (발도/스왑 블립 루트 코즈 픽스, 2026-06-11 로그 실증). 발도 순간 보폭 게이트는
 	// 즉시 350 으로 떨어지지만 실속도는 관성 감쇠(500→443→394, 3~4프레임) — 그 구간이 Speed2D 단독 게이트
 	// (>=420)를 통과시켜 Sprint 풀(Run_Root 등 고속 클립)이 2프레임 합류→탈락. continuing DB 탈락은 interrupt
 	// 모드와 무관하게 강제 재검색이라 위 래치로 못 막음 → jog→sprint클립→jog 이중 스냅 = 블립.
-	// 자격 = 의도(bIsSprinting) || 감속 히스테리시스(자격 유지 중 Speed2D>=SprintPoolJoinSpeed) —
+	// 자격 = 의도(bIsSprinting) || 감속 히스테리시스(자격 유지 중 Speed2D>=해당 무기 프로파일의 SprintPoolJoinSpeed) —
 	// 속도는 전환 순간 거짓말을 하지만 입력 의도는 즉시 진실. sprint 해제 감속 핸드오프는 히스테리시스가 보존.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation|MotionMatching")
 	bool bSprintPoolEligible = false;
 
-	// Sprint 풀 합류 속도 하한. 이 값(500)은 3곳이 반드시 합의해야 하는 단일 계약값이다(FIND-045 P2 C부록, 07-25):
-	//   ① 여기(C++ SprintPoolJoinSpeed) → bSprintPoolEligible 히스테리시스 하한
-	//   ② CHT_VB_PoseSearchDatabases_Fighter_Dense 의 Sprint 합류 행 FloatRange Min 셀
-	//   ③ CHT_VB_PoseSearchDatabases_Katana_Dense 의 Sprint 합류 행 FloatRange Min 셀
-	//   (BigSword Dense 는 sprint 없음=순항 캡이라 제외. 무기 Dense CHT 추가 시 그 셀도 이 목록에 편입할 것.)
-	// MMSprintGateSpeed 가 ①의 자격을 ②③ 컬럼 입력으로 나른다 → 세 값이 어긋나면 히스테리시스 창과 풀 게이트가
-	// 불일치해 발도/스왑 감쇠 구간에 sprint 클립이 2프레임 합류→탈락 = 블립/스케이트 재발(06-11 라운드3 이력).
-	// chooser 셀은 에셋이라 C++ 이 못 읽는다 → 자동 단일화 불가. 이 주석이 유일한 드리프트 방어이니 한 곳 바꾸면 3곳 다 바꿀 것.
-	// 500 = Run 순항(430)보다 위·Sprint 1단(585)보다 아래 — 순항이 히스테리시스에 영구 걸리는 것 방지 (구 420은 430 순항에서 파탄).
-	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|MotionMatching")
-	float SprintPoolJoinSpeed = 500.0f;
+	// 하한의 홈은 UVBMovementConfig 각 프로파일이다: Fighter/Katana=500, BigSword=400.
+	// 각 Dense Chooser의 Sprint 행 Min과 jog 행 Max도 같은 값으로 맞춘다.
+	// MMSprintGateSpeed는 의도/감속 자격이 없으면 0이므로, 무장 전환 중 고속 클립이 잠깐 합류하지 않는다.
 
 	// 풀 교체 interrupt 수렴 판정 - 현재 속도가 CMC 목표 최대속도에 이만큼(cm/s) 이내로 붙으면 보폭이 수렴한 것으로 본다.
 	// 왜 기다리는가: 무장 전환 직후 속도가 감쇠하는 과도기에 발화하면 MM 이 옛 속도에 맞는 클립을 골랐다가
-	//   수렴 후 다시 고른다 - 한 번의 스왑이 화면에서 두 번 갈아타는 블립이 된다.
+	// 수렴 후 다시 고른다 - 한 번의 스왑이 화면에서 두 번 갈아타는 블립이 된다.
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|MotionMatching")
 	float PoolInterruptSpeedSettleTolerance = 40.0f;
 
@@ -481,9 +643,9 @@ protected:
 	
 	// 전투모드 — WSC->IsInCombat() 미러 (DEC-006: 상태2·3 모두 true).
 	// "TIP A/B 세트 선택에 사용" 이라던 서술은 거짓이 됐다(2026-08-17 정정): 구 A/B(평상/전투) 세트는 FIND-029
-	//   무기별 리모델로 은퇴했고(VBAnimInstance.cpp:1037) SelectTIPMontage 는 CurrentWeaponType 으로 키를 잡는다.
-	//   현재 C++ 소비처는 0이고 대입(:262)만 남아 있다. BlueprintReadOnly 라 ABP 가 읽을 여지는 있으나
-	//   그 여부는 미확인 - 제거하려면 ABP 그래프 판독이 선행돼야 한다.
+	// 무기별 리모델로 은퇴했고(VBAnimInstance.cpp:1037) SelectTIPMontage 는 CurrentWeaponType 으로 키를 잡는다.
+	// 현재 C++ 소비처는 0이고 대입(:262)만 남아 있다. BlueprintReadOnly 라 ABP 가 읽을 여지는 있으나
+	// 그 여부는 미확인 - 제거하려면 ABP 그래프 판독이 선행돼야 한다.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	bool bIsCombatMode;
 
@@ -509,9 +671,9 @@ protected:
 
 	// 메시가 캡슐보다 얼마나 덜 돌았는가(도). MM 경로 TIP 게이트의 입력이다.
 	// RootYawOffset 과의 차이: 저쪽은 우리가 누적·감쇠로 '추정'한 장부값이고, 이쪽은 OffsetRootBone
-	//   노드의 SimulatedRotation 과 컴포넌트 회전의 차이를 매 프레임 '측정'한 값이다. 클립 루트모션이
-	//   메시를 돌리면 줄고 캡슐이 돌면 늘어 노드가 이미 루프를 닫아 준다 - 그래서 MM 경로에는
-	//   소비자(몽타주 TurnYaw 커브)가 없어도 된다. FIND-029, 설계 .sw/armed-tip-rotation/design.md.
+	// 노드의 SimulatedRotation 과 컴포넌트 회전의 차이를 매 프레임 '측정'한 값이다. 클립 루트모션이
+	// 메시를 돌리면 줄고 캡슐이 돌면 늘어 노드가 이미 루프를 닫아 준다 - 그래서 MM 경로에는
+	// 소비자(몽타주 TurnYaw 커브)가 없어도 된다. FIND-029, 설계 .sw/armed-tip-rotation/design.md.
 	// 값은 노드 평가 뒤에 갱신되므로 한 프레임 지연이다(게이트 판정에는 무해).
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	float MeasuredRootYawOffset = 0.0f;
@@ -648,10 +810,10 @@ protected:
 	// 새 임계치는 IsPivotingStrafeThreshold/IsPivotingFreeThreshold/ShouldSpinTransition*/ShouldTurnInPlaceYawDelta 로 분리.
 
 	// GASP Get_MMBlendTime 원본 4분기 상수값 — CDO 검증 결과 (정정 2026-04-27):
-	//   Default(Grounded↔Grounded): 0.4s (이전 추정 0.3)
-	//   FastLand(Grounded←InAir): 0.2s (이전 추정 0.1, 너무 짧음)
-	//   VeryShortJump(InAir+Vel.Z>thr): 0.15s (이전 추정 0.05)
-	//   InAirDefault(InAir 안정): 0.5s (이전엔 Default 와 같이 묶음 — GASP 분리)
+	// Default(Grounded↔Grounded): 0.4s (이전 추정 0.3)
+	// FastLand(Grounded←InAir): 0.2s (이전 추정 0.1, 너무 짧음)
+	// VeryShortJump(InAir+Vel.Z>thr): 0.15s (이전 추정 0.05)
+	// InAirDefault(InAir 안정): 0.5s (이전엔 Default 와 같이 묶음 — GASP 분리)
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|MotionMatching")
 	float MMDefaultBlendTime = 0.4f;
 
@@ -704,7 +866,7 @@ protected:
 	// DEC-007 Phase A: enum 직캐스트(0~2)에 crouch 전용 핀 3 이 추가된 4핀 인덱스 공간 —
 	// 0=Unarmed MM / 1=상태2·3 MM(Fighter/Katana/BigSword) / 2=상태3 SM / 3=crouch SM (MM에 crouch 포즈 없음).
 	// pin2(index 2)는 죽은 코드가 아니다: 상태3 인데 MMWeaponType==None 인 경우 = 비-MM 전투무기 fallback.
-	//   현재 유일 도달 케이스 = Magic 무기(Armed MM 미구축, EVBWeaponType::Magic). F/K/B 는 index 1(MM)로 감.
+	// 현재 유일 도달 케이스 = Magic 무기(Armed MM 미구축, EVBWeaponType::Magic). F/K/B 는 index 1(MM)로 감.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	int32 LocomotionStateIndex = 0;
 
@@ -719,11 +881,11 @@ protected:
 
 	// DEC-007 P4: CHT WeaponType 분기(MasterChooserTable) 바인딩 전용 — MM 노드가 검색할 무기 풀을 가른다.
 	// 값의 출처는 무기 데이터다(2026-08-14 DEBT-010): UVBWeaponStateComponent::GetMMPoolForState 가
-	//   WeaponDataMap 의 ArmedMMPool/SheathedMMPool 을 읽어 돌려주며, 여기서 무기 이름을 나열하지 않는다.
-	//   None = 무기 없는 기본 풀. 평상·전용 풀이 없는 무기·미등록 무기가 전부 None 이다.
+	// WeaponDataMap 의 ArmedMMPool/SheathedMMPool 을 읽어 돌려주며, 여기서 무기 이름을 나열하지 않는다.
+	// None = 무기 없는 기본 풀. 평상·전용 풀이 없는 무기·미등록 무기가 전부 None 이다.
 	// CurrentWeaponType(선택무기 기억 — TIP 몽타주/재발도용) 과 의미 분리.
 	// AVBCharacter::UpdateMaxSpeed 가 같은 값으로 속도 프로파일도 고른다 — 클립과 보폭의 출처를 하나로 묶어
-	//   워프비가 윈도우를 벗어나지 않게 한다.
+	// 워프비가 윈도우를 벗어나지 않게 한다.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	EVBWeaponType MMWeaponType = EVBWeaponType::None;
 
@@ -739,37 +901,38 @@ protected:
 	// ABP 의 무기별 BlendListByInt 핀 순서를 선언한다. 인덱스가 곧 핀 번호이고 배열 길이가 곧 핀 개수다.
 	//
 	// 왜 enum 을 그대로 핀 번호로 쓰지 않는가: EVBWeaponType 은 append-only 라 콘텐츠 없는 선언도 영구히
-	//   남는다. enum 직결이면 그 빈자리마다 핀을 만들어야 하고, 만들지 않으면 엔진이 마지막 자식으로
-	//   클램프해 새 무기가 조용히 다른 무기의 포즈를 재생한다(FAnimNode_BlendListByInt::GetActiveChildIndex).
-	//   핀은 저작된 포즈가 있을 때만 생기므로 핀 순서의 홈은 enum 이 아니라 그 포즈를 담은 자산이다.
+	// 남는다. enum 직결이면 그 빈자리마다 핀을 만들어야 하고, 만들지 않으면 엔진이 마지막 자식으로
+	// 클램프해 새 무기가 조용히 다른 무기의 포즈를 재생한다(FAnimNode_BlendListByInt::GetActiveChildIndex).
+	// 핀은 저작된 포즈가 있을 때만 생기므로 핀 순서의 홈은 enum 이 아니라 그 포즈를 담은 자산이다.
 	//
 	// 왜 여기(ABP CDO)인가: 핀을 늘리는 편집과 이 배열을 늘리는 편집이 같은 자산, 같은 세션에서
-	//   일어난다. 두 편집이 한 작업이 되면 어긋날 자리가 없어진다. 또한 배열 길이와 실제 핀 개수를
-	//   정적으로 대조할 수 있어, 불일치가 PIE 가 아니라 리드백에서 잡힌다.
+	// 일어난다. 두 편집이 한 작업이 되면 어긋날 자리가 없어진다. 또한 배열 길이와 실제 핀 개수를
+	// 정적으로 대조할 수 있어, 불일치가 PIE 가 아니라 리드백에서 잡힌다.
 	//
 	// 2026-08-19 이전에는 이 배열이 없고 enum 값이 곧 핀 번호였다. None(0) 이 자기 콘텐츠가 없어
-	//   핀0 을 카타나에 물렸고, 그 결과 핀0·1 이 같은 노드를 가리키는 팬아웃이 8곳에 생겼다
-	//   (한 노드가 한 프레임에 두 번 평가돼 애니가 2배속이 되고, UE5.8 2-pose 고속경로가 에디터를 죽인다).
-	//   조밀 인덱스는 그 남는 핀 자체를 없애 팬아웃이 생길 자리를 지운다.
+	// 핀0 을 카타나에 물렸고, 그 결과 핀0·1 이 같은 노드를 가리키는 팬아웃이 8곳에 생겼다
+	// (한 노드가 한 프레임에 두 번 평가돼 애니가 2배속이 되고, UE5.8 2-pose 고속경로가 에디터를 죽인다).
+	// 조밀 인덱스는 그 남는 핀 자체를 없애 팬아웃이 생길 자리를 지운다.
 	//
 	// 저작 규칙: 핀을 추가할 때만 행을 추가한다. 배열에 없는 무기는 인덱스 0 + 경고로 떨어진다 —
-	//   클램프처럼 조용히 틀리지 않는다.
-	//   예외는 None 하나다. 이 로스터는 조밀해서 None 항목이 없지만 평상 상태가 곧 None 이므로
-	//   결함이 아니다 — ResolveWeaponPoseIndex 가 조회 전에 0 으로 돌려보내고 경고도 내지 않는다.
+	// 클램프처럼 조용히 틀리지 않는다.
+	// 예외는 None 하나다. 이 로스터는 조밀해서 None 항목이 없지만 평상 상태가 곧 None 이므로
+	// 결함이 아니다 — ResolveWeaponPoseIndex 가 조회 전에 0 으로 돌려보내고 경고도 내지 않는다.
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|PoseContract")
 	TArray<EVBWeaponType> WeaponPoseSlots;
 
 	// crouch 계열의 핀 공간은 위와 다르다. 여기서는 인덱스 0 이 자기 콘텐츠를 가진다
-	//   (납도 공용 ver_A) — 무기별 포즈를 빌려 쓰는 자리가 아니므로 None 항목이 정당하다.
-	// ArmedExplorationLocomotion 의 crouch 는 이 배열이 아니라 WeaponPoseSlots 를 쓴다(납도 공용이
-	//   카타나 포즈와 같아 별도 슬롯이 필요 없다).
+	// (납도 공용 ver_A) — 무기별 포즈를 빌려 쓰는 자리가 아니므로 None 항목이 정당하다.
+	// ABP 상태머신 `ArmedExplorationLocomotion`(enum 이 아니라 상태3 SM 의 자산 이름이다 — DEC-006 이전
+	// 의미의 잔재이고 2026-09-09 enum 개명에 딸려오지 않았다)의 crouch 는 이 배열이 아니라
+	// WeaponPoseSlots 를 쓴다(납도 공용이 카타나 포즈와 같아 별도 슬롯이 필요 없다).
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|PoseContract")
 	TArray<EVBWeaponType> CrouchPoseSlots;
 
 	// 무기 -> BlendListByInt 핀 번호. 미등록은 0 + 최초 1회 경고.
 	// 매 프레임 캐릭터마다 호출되지만 로스터가 3~4개라 선형 탐색 비용이 잡음 수준이다(캐시 불필요).
-	//   캐시로 옮길 시점: 로스터가 16~20개를 넘거나, GT 프로파일에서 이 함수가 잡음 위로 올라올 때.
-	//   그때는 NativeInitializeAnimation 에서 TMap<EVBWeaponType,int32> 를 한 번 만들어 쓴다.
+	// 캐시로 옮길 시점: 로스터가 16~20개를 넘거나, GT 프로파일에서 이 함수가 잡음 위로 올라올 때.
+	// 그때는 NativeInitializeAnimation 에서 TMap<EVBWeaponType,int32> 를 한 번 만들어 쓴다.
 	int32 ResolveWeaponPoseIndex(EVBWeaponType InWeaponType);
 	int32 ResolveCrouchPoseIndex(EVBWeaponType InWeaponType);
 
@@ -779,12 +942,87 @@ protected:
 
 	// 사망 여부 - State.Dead 태그를 매 tick 미러링한다.
 	// ABP 가 사망 시 두 노드를 무력화하는 데 쓴다. 이 두 노드는 살아있는 로코모션 전용이고
-	// 사망 포즈에는 능동적으로 해롭다.
-	//   OffsetRootBone: 메시와 캡슐의 위치차를 흡수한다(Interpolate, maxTranslationError=30).
-	//     사망 몽타주의 루트모션이 캡슐을 끌고 가도 그 델타를 오프셋으로 먹어 화면에 안 나타난다.
-	//   LegIK: Alpha 가 상수 1 이라 누워 있는 포즈의 발까지 지면에 맞추려 해 다리가 뒤틀린다.
+	// 사망 포즈에는 능동적으로 해롭다. (LegIK 는 처형 장면에서도 같은 이유로 꺼진다 - 그쪽은
+	// bIsDead 가 아니라 LegIKAlpha 하나로만 갈린다. 처형 중 캡슐은 정상이라 OffsetRootBone 은 그대로 둔다.)
+	// OffsetRootBone: 메시와 캡슐의 위치차를 흡수한다(Interpolate, maxTranslationError=30).
+	// 사망 몽타주의 루트모션이 캡슐을 끌고 가도 그 델타를 오프셋으로 먹어 화면에 안 나타난다.
+	// LegIK: Alpha 가 상수 1 이라 누워 있는 포즈의 발까지 지면에 맞추려 해 다리가 뒤틀린다.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	bool bIsDead = false;
+
+	// 렛지에 매달려 있는가 - ABP 매달림 분기(Blend Poses by bool, BS_VB_LedgeHang)의 스위치.
+	// UpdatePoseOverrideState 가 트래버설 컴포넌트를 매 프레임 미러한다. 매달림 동안은 OffsetRootBone 을 Release 로
+	//   두고(캡슐을 컴포넌트가 손으로 옮기므로 오프셋이 쌓이면 메시가 뒤처진다) LegIK 를 끈다(허공의 발에 지면 IK 는 해롭다).
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	bool bIsHanging = false;
+
+	// 옆걸음 축 -1(왼쪽)~+1(오른쪽). BS_VB_LedgeHang 의 X 에 물린다. 매달림이 아니면 0.
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float HangMoveAxis = 0.0f;
+
+	// 자유 등반. 매달림과 같은 이유로 OffsetRootBone 을 Release 로 두고 LegIK 를 끈다.
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	bool bIsClimbing = false;
+
+	// 등반 블렌드스페이스의 두 축. X=-1(왼쪽)~+1(오른쪽), Y=-1(아래)~+1(위). 등반이 아니면 0.
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float ClimbMoveAxisX = 0.0f;
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float ClimbMoveAxisY = 0.0f;
+
+
+	// 매달림 IK 목표(월드) - ABP 의 TwoBoneIK 네 개가 EffectorLocation 핀으로 읽는다.
+	// 값의 홈은 트래버설 컴포넌트이고 여기는 매 프레임 미러만 한다.
+	// 왜 IK 가 필요한가: 이 캡처는 손(33)과 발(53)이 같은 평면에 없어서 평평한 벽에 둘 다 맞출 수 없다.
+	//   몸은 깊은 쪽(발)에 맞춰 놓고, 손은 여기 목표로 당겨 렛지에 붙인다.
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	FVector HangHandTargetL = FVector::ZeroVector;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	FVector HangHandTargetR = FVector::ZeroVector;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	FVector HangFootTargetL = FVector::ZeroVector;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	FVector HangFootTargetR = FVector::ZeroVector;
+
+	// 각 체인의 IK 세기 0~1. 0 이면 그 말단은 애니 그대로다(뻗는 중인 손, 벽을 못 찾은 발).
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float HangHandIKWeightL = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float HangHandIKWeightR = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float HangFootIKWeightL = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
+	float HangFootIKWeightR = 0.0f;
+
+	// 처형 장면 안인가. UpdatePoseOverrideState 가 매 프레임 갱신한다(bIsDead 와 같은 자리).
+	//
+	// 왜 멤버인가: 쓰는 곳이 둘이다 - LegIK 를 끄는 것과 제자리 회전(TIP)을 막는 것.
+	// TIP 은 몽타주를 트는데 그 슬롯이 처형 몽타주와 DefaultGroup 을 공유한다. 막지 않으면
+	// TIP 이 처형 몽타주를 끊고, 플러그인이 그것을 「장면 이탈」로 읽어 장면이 통째로 죽는다.
+	// 2026-09-13 user PIE 실측: 자리 맞춤 12밀리초 뒤 AM_TIP_RM_Katana_TurnRight90 이 들어와
+	// 3.07초짜리 장면이 0.012초에 끝났다. 사망 몽타주가 끊기던 것과 같은 기계다(그 게이트 주석 참조).
+	// 왜 TIP 이 발동하나: StartFinisher 가 공격자를 자리에 맞출 때 액터 회전만 바꾸고 컨트롤 회전은
+	// 그대로 둔다. TIP 은 그 차이를 「돌아야 할 각」으로 읽는다(로그 요청=91.1도).
+	// 컨트롤 회전을 같이 돌리지 않는 이유는 그러면 플레이어 시점이 홱 돌아가기 때문이다 -
+	// 처형 중 화면은 전용 카메라가 든다.
+	bool bInFinisherScene = false;
+
+	// 저작된 포즈가 지금 이 몸을 쥐고 있는가. 사망이든 처형이든 「로코모션이 몽타주를 틀면 안 되는 상태」다.
+	//
+	// 왜 위 둘을 OR 해 따로 두나: 로코모션이 물을 질문은 «죽었나» 도 «처형 중인가» 도 아니라
+	//   «내가 이 몸을 움직여도 되나» 하나다. 소유자 목록으로 답하면 소유자가 늘 때마다 묻는 쪽을
+	//   전부 고쳐야 하고, 한 곳을 빠뜨리면 그 기능에서만 조용히 되돌아온다.
+	//   그 되돌아옴을 두 번 겪었다 - 사망 몽타주가 TIP 에 끊겨 시체가 일어섰고, 처형 몽타주가
+	//   같은 자리에서 끊겨 「어쩔 때 처형 애니가 안 나온다」가 됐다(2026-09-13).
+	// 다음 소유자(연출 컷신 등)는 UpdatePoseOverrideState 의 그 한 줄에 OR 를 더하면 된다.
+	//   묻는 쪽은 안 바뀐다.
+	bool bPoseOwnedByMontage = false;
 
 	// 사망 시 OffsetRootBone 의 Translation/Rotation 모드로 넣을 값.
 	// Release = 누적된 오프셋을 놓아 메시가 캡슐에 곧바로 붙는다.
@@ -795,19 +1033,19 @@ protected:
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	EOffsetRootBoneMode OffsetRootRotationMode = EOffsetRootBoneMode::Accumulate;
 
-	// 사망 시 0 - LegIK Alpha 핀에 물린다.
+	// 사망·처형 장면에 0 - LegIK Alpha 핀에 물린다.
 	UPROPERTY(BlueprintReadOnly, Category="Vowbound|Animation")
 	float LegIKAlpha = 1.0f;
 
 	// AnimGraph 핀 바인딩은 변수가 아닌 함수만 받는다. enum 2종은 UHT 가 접근자를 자동 생성해 주지만
-	// float 은 생성되지 않아 직접 둔다. 값 계산은 UpdateDeathState 에서 끝나고 여기서는 읽기만 한다.
+	// float 은 생성되지 않아 직접 둔다. 값 계산은 UpdatePoseOverrideState 에서 끝나고 여기서는 읽기만 한다.
 	UFUNCTION(BlueprintPure, Category="Vowbound|Animation")
 	float GetLegIKAlpha() const;
 
 
 private:
 	// State.Dead 를 미러링해 bIsDead / OffsetRoot 모드 2종 / LegIKAlpha 를 갱신한다.
-	void UpdateDeathState(const APawn* OwnerPawn);
+	void UpdatePoseOverrideState(const APawn* OwnerPawn);
 
 	// GASP UpdateEssentialValues 대응 — 매 tick 속도/가속/trajectory 파생 변수 갱신.
 	// NativeUpdateAnimation 시작 부분에서 호출.
@@ -815,14 +1053,14 @@ private:
 
 	// R-006 추출(2026-07-05, Design_VBAnimInstance_Refactor.md): NativeUpdateAnimation 인라인 phase 분할.
 	// 동작 보존(byte-identical 로직 relocate) — 각 헬퍼는 this 멤버를 조작하며 호출 순서·불변식 유지가 계약.
-	void UpdateTrajectory(float DeltaSeconds, class ACharacter* Character);            // GASP 궤적 예측+충돌 → Trajectory/FutureVelocity/TrajectoryCollision
+	void UpdateTrajectory(float DeltaSeconds, class ACharacter* Character); // GASP 궤적 예측+충돌 → Trajectory/FutureVelocity/TrajectoryCollision
 	void UpdateLocomotionAngle(float DeltaSeconds, const class ACharacter* Character); // Velocity 방향 보간 → LocomotionAngle (OW 입력)
-	void UpdatePlayRate();                                                             // 속도/Gait → WantedPlayRate (SpeedRemappingCurve)
+	void UpdatePlayRate(); // 속도/Gait → WantedPlayRate (SpeedRemappingCurve)
 	void UpdateMovementStateAndGait(bool bHasMovementInput, bool bSprintActive, EVBGait CharacterGait); // → MMState/Gait/LastMovingGait
-	void UpdateTurnLag(float DeltaSeconds, float ActorYawDelta);                       // DEBT-006 무장 이동 턴-래그 스프링 → ArmedTurnLagYaw
+	void UpdateTurnLag(float DeltaSeconds, float ActorYawDelta); // DEBT-006 무장 이동 턴-래그 스프링 → ArmedTurnLagYaw
 	// FEEL-critical (FIND-030). R-007 풀 교체 interrupt 2 트리거(수렴 래치 + 발도↔납도 즉시) 통합.
-	//   동작 보존 필수 — 변경 후 BigSword 발도/납도 FEEL 재확인할 것.
-	void EvaluatePoolInterrupt(float DeltaSeconds, class UCharacterMovementComponent* CMC, EVBLocomotionState RawState); // → bFirePoolInterrupt
+	// 동작 보존 필수 — 변경 후 BigSword 발도/납도 FEEL 재확인할 것.
+	void EvaluatePoolInterrupt(float DeltaSeconds, class UCharacterMovementComponent* CMC, EVBLocomotionState InLocomotionState); // → bFirePoolInterrupt
 
 	// GASP UpdateStates 대응 — MMState/MovementMode/RotationMode/Stance/Gait 전환 + _LastFrame 캐시.
 	// UpdateEssentialValues 이후 호출.
@@ -846,12 +1084,12 @@ private:
 
 	// «아직 돌아야 할 회전량» - 정규화하지 않은 부호 있는 각 (2026-09-04, Codex 설계).
 	// AimYaw 는 -180..180 으로 정규화된 최단 경로라 오른쪽으로 200 도를 돌리면 -160 으로 읽혀 왼쪽 클립이 나간다
-	//   (2026-09-04 user PIE 로그 5건). 종전에는 «감은 양» 을 따로 세고 AimYaw 의 부호와 조합해 방향을 추측했는데,
-	//   그 추측의 경계(먼 길 195)에서 입력 1도 차이로 방향이 뒤집혔다.
+	// (2026-09-04 user PIE 로그 5건). 종전에는 «감은 양» 을 따로 세고 AimYaw 의 부호와 조합해 방향을 추측했는데,
+	// 그 추측의 경계(먼 길 195)에서 입력 1도 차이로 방향이 뒤집혔다.
 	// 이 값은 매 프레임 AimYaw 의 변화량을 정규화해 더한다 - 회전 중에도. 캡슐이 도는 만큼 자연히 줄고,
-	//   잔여 위에 되감으면 그냥 덧셈이다. 요청의 방향과 크기가 이 값 하나에서 나온다. 중립에서 AimYaw 로 다시 맞춘다(표류 방지).
+	// 잔여 위에 되감으면 그냥 덧셈이다. 요청의 방향과 크기가 이 값 하나에서 나온다. 중립에서 AimYaw 로 다시 맞춘다(표류 방지).
 	float UnwrappedRemainingYaw = 0.0f;
-	float PrevAimYawForUnwrap   = 0.0f;
+	float PrevAimYawForUnwrap = 0.0f;
 
 
 	// 이전 프레임 Actor Yaw 저장
@@ -864,7 +1102,7 @@ private:
 	void UpdateRootYawOffset(float DeltaSeconds, float ActorYawDelta);
 	// OffsetRootBone 노드에서 메시-캡슐 회전 오프셋을 읽어 MeasuredRootYawOffset 을 갱신한다.
 	// 노드는 ABP 의 AnimNodeProperties 를 타입으로 훑어 한 번만 찾고 캐시한다(이름/인덱스에 의존하지 않아
-	//   ABP 를 재배선해도 안 깨진다). 노드가 없으면 조용히 0 을 유지 - 그 경우 MM TIP 은 발동하지 않는다.
+	// ABP 를 재배선해도 안 깨진다). 노드가 없으면 조용히 0 을 유지 - 그 경우 MM TIP 은 발동하지 않는다.
 	void UpdateMeasuredRootYawOffset();
 	// 위 함수가 처음 한 번만 해석해 캐시한다. UObject 가 아니라 GC 대상이 아니며, 노드 실체는 이
 	// AnimInstance 인스턴스 안에 있어 수명이 같다. 해석 실패도 캐시해 매 프레임 재탐색을 막는다.
@@ -914,26 +1152,26 @@ private:
 	bool bTurnFallbackUntilNeutral = false;
 
 	// 몽타주 경로가 회전을 소유하는 동안 옛 장부가 «그 회전» 을 쌓는다. UpdateRootYawOffset 은 경로와
-	//   무관하게 매 프레임 돌고, 소유 중에는 bShouldTurnInPlace 도 bPostTIPBlendOut 도 거짓이라
-	//   「안 움직임 -> Accelerate」 가지로 떨어지기 때문이다. 그렇게 쌓인 값은 소유권이 옛 경로로
-	//   돌아가는 순간(전투 타이머 만료로 저절로 납도되는 때가 그렇다) 회전 요청으로 읽혀
-	//   user 가 조작하지 않은 «유령 회전» 을 만든다. 2026-08-29 user PIE 로그가 그 순간을 잡았다 -
-	//   `aim=-0.0` 인데 `measured=-32.8` 로 게이트가 열렸다.
+	// 무관하게 매 프레임 돌고, 소유 중에는 bShouldTurnInPlace 도 bPostTIPBlendOut 도 거짓이라
+	// 「안 움직임 -> Accelerate」 가지로 떨어지기 때문이다. 그렇게 쌓인 값은 소유권이 옛 경로로
+	// 돌아가는 순간(전투 타이머 만료로 저절로 납도되는 때가 그렇다) 회전 요청으로 읽혀
+	// user 가 조작하지 않은 «유령 회전» 을 만든다. 2026-08-29 user PIE 로그가 그 순간을 잡았다 -
+	// `aim=-0.0` 인데 `measured=-32.8` 로 게이트가 열렸다.
 	// 계측 (FIND-029) - 「루트모션이 캡슐에 실제로 얼마를 전달했나」를 재기 위해 시작 시점을 기억한다.
-	//   정적으로는 잴 수 없다(디버그 함수의 delta 는 병진만, AnimMontage 는 회전 추출을 파이썬에 안 연다).
-	//   회전이 끝나는 프레임에 «요청 / 실제 캡슐 회전» 을 나란히 찍으면 전달 여부가 숫자로 갈린다.
+	// 정적으로는 잴 수 없다(디버그 함수의 delta 는 병진만, AnimMontage 는 회전 추출을 파이썬에 안 연다).
+	// 회전이 끝나는 프레임에 «요청 / 실제 캡슐 회전» 을 나란히 찍으면 전달 여부가 숫자로 갈린다.
 	float TurnStartCapsuleYaw = 0.0f;
-	float TurnRequestedYaw    = 0.0f;
+	float TurnRequestedYaw = 0.0f;
 
 	// 커밋 대기 중 지금까지 본 요구 각도(부호 있음). 카메라가 멎으면 이 값으로 클립을 고른다.
 	float PendingTurnRequestYaw = 0.0f;
 
-	bool bRootMotionTurnOwnedLastFrame   = false;   // 소유권이 넘어온 프레임을 잡기 위한 직전 상태
-	bool bSuppressLegacyTIPUntilNeutral  = false;   // 인계 직후: 남은 찌꺼기로는 회전을 열지 않는다
+	bool bRootMotionTurnOwnedLastFrame = false; // 소유권이 넘어온 프레임을 잡기 위한 직전 상태
+	bool bSuppressLegacyTIPUntilNeutral = false; // 인계 직후: 남은 찌꺼기로는 회전을 열지 않는다
 
 	// 걸쇠를 «조합이 바뀌었을 때» 도 풀기 위한 직전 조합. 무기를 바꿨는데 이전 실패가 남아 있으면
-	//   새 프로필이 멀쩡한데도 회전을 안 한다(2026-08-29 Codex 지적 - 주석은 그렇게 푼다고 적어놓고
-	//   구현은 이동·낙하·중립 복귀에서만 풀고 있었다).
+	// 새 프로필이 멀쩡한데도 회전을 안 한다(2026-08-29 Codex 지적 - 주석은 그렇게 푼다고 적어놓고
+	// 구현은 이동·낙하·중립 복귀에서만 풀고 있었다).
 	EVBWeaponType LastTurnPoseWeapon = EVBWeaponType::None;
 	bool bLastTurnCrouching = false;
 
@@ -967,13 +1205,13 @@ private:
 	float TIPThreshold = 80.0f;		// TIP 트리거 각도
 	
 	// MM 경로 전용 TIP 임계값. 위 TIPThreshold/TIPExitThreshold 와 **다른 양**을 재므로 값을 공유하면 안 된다.
-	//   SM 경로  = RootYawOffset — 우리가 누적하는 장부값. 실측 피크 108~179도.
-	//   MM 경로  = MeasuredRootYawOffset — OffsetRootBone 의 메시-캡슐 차이. 실측 피크 30~71도.
+	// SM 경로 = RootYawOffset — 우리가 누적하는 장부값. 실측 피크 108~179도.
+	// MM 경로 = MeasuredRootYawOffset — OffsetRootBone 의 메시-캡슐 차이. 실측 피크 30~71도.
 	// 2026-08-18 에 SM 값(80/15)을 그대로 MM 에 썼다가 게이트가 거의 안 열렸다(로그 tip=0, 에피소드 0.02~0.32초).
 	// 범위가 다른 이유: 노드의 RotationHalfLife 가 0.100 이라 실측값은 0.1초 반감기로 감쇠한다 →
-	//   누적 부채가 아니라 **현재 회전 속도의 대리 지표**다(캡슐 125deg/s 이면 약 18도, 빠른 플릭이면 50~70도).
+	// 누적 부채가 아니라 **현재 회전 속도의 대리 지표**다(캡슐 125deg/s 이면 약 18도, 빠른 플릭이면 50~70도).
 	// 그래서 20 은 "실제 회전이면 반드시 넘는" 값이고(실측 최소 피크 30), 8 은 회전이 잦아들면 0.3초 안에
-	//   떨어지는 값이다. 게이트가 열려 있는 시간 = 실제로 돌린 시간 + 약 0.3초 꼬리.
+	// 떨어지는 값이다. 게이트가 열려 있는 시간 = 실제로 돌린 시간 + 약 0.3초 꼬리.
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation", meta=(ClampMin="0.0"))
 	float TIPThresholdMM = 20.0f;
 
@@ -1025,7 +1263,7 @@ private:
 
 	// DEBT-006: 턴-래그가 동작하는 최소 지상속도(cm/s). 이 미만에서는 흡수하지 않는다.
 	// 왜 하한이 필요한가: 턴-래그는 '이동 중' 하체가 늦게 따라오는 연기이고 제자리 회전은 TIP(RootYawOffset) 전담이다.
-	//   하한이 없으면 정지 직전 잔속도 구간에서 두 시스템이 같은 요를 동시에 건드려 발이 미끄러진다.
+	// 하한이 없으면 정지 직전 잔속도 구간에서 두 시스템이 같은 요를 동시에 건드려 발이 미끄러진다.
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Animation|ArmedLocomotion")
 	float ArmedTurnLagMinSpeed = 10.0f;
 

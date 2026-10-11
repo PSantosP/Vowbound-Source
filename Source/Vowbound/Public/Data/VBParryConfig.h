@@ -4,10 +4,11 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "Character/VBWeaponStateTypes.h" // EVBWeaponType (TMap 키) — VBDodgeConfig.h:7 동형
+#include "Types/VBWeaponStateTypes.h" // EVBWeaponType (TMap 키) — VBDodgeConfig.h:7 동형
 #include "VBParryConfig.generated.h"
 
 class UAnimMontage;
+class UChooserTable;
 class FDataValidationContext; // IsDataValid 인자 — 헤더에서 Misc/DataValidation.h 를 끌지 않는다
 
 /**
@@ -29,6 +30,10 @@ struct FVBGuardSet
 	//  버그가 아니라 기존 설계다(가드는 몽타주 없이도 성립 — 판정은 정상이고 화면만 없다).
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Parry")
 	TObjectPtr<UAnimMontage> GuardMontage = nullptr;
+
+	// 가드 자세로 저작한 Idle/Turn 선택기. 비어 있으면 기존 전신 가드를 유지한다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Parry")
+	TObjectPtr<UChooserTable> GuardLocomotionChooser = nullptr;
 
 	// 패링/블록 성립 순간 재생하는 받아넘김(전신 DefaultSlot, 가드 몽타주를 덮는다).
 	// 블렌드인은 반드시 0.06s 로 저작할 것. 기본 0.25s 면 짧은 Accept 클립(BigSword=0.267s)이 페이드인만 하다 끝난다.

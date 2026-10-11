@@ -16,6 +16,9 @@ UVBGA_WeaponSummon::UVBGA_WeaponSummon()
 	ActivationBlockedTags.AddTag(VBGameplayTags::State_Weapon_Summoning);
 	ActivationBlockedTags.AddTag(VBGameplayTags::State_Weapon_Sheathing);
 	ActivationBlockedTags.AddTag(VBGameplayTags::State_Combat_Attacking);
+	// 다른 기능이 무기를 임시 수납해 둔 동안(아이템 사용 동작 - UVBGA_UseItem 이 이 태그를 단다) Tab 이 끼어들면
+	//   수납 상태와 실제 소환이 엉킨다. 그 기능이 끝나며 무기를 돌려놓으므로 그동안은 받지 않는다.
+	ActivationBlockedTags.AddTag(VBGameplayTags::State_Weapon_TempSheathed);
 	// ActivationBlockedTags.AddTag(VBGameplayTags::State_Traversal);
 	
 	InputTag = VBGameplayTags::Input_WeaponSummon;

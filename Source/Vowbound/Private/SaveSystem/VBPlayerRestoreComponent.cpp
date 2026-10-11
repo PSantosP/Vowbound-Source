@@ -1,6 +1,11 @@
 // VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #include "SaveSystem/VBPlayerRestoreComponent.h"
+#include "SaveSystem/VBSaveGame.h"
+#include "SaveSystem/VBSaveParticipantSubsystem.h"
+#include "GameFramework/Controller.h"
+#include "Character/VBPlayerRagdollComponent.h"
+#include "Interaction/VBGASPSmartObjectComponent.h"
 
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -18,21 +23,124 @@ UVBPlayerRestoreComponent::UVBPlayerRestoreComponent()
 	PrimaryComponentTick.bCanEverTick = false;
 }
 
+void UVBPlayerRestoreComponent::OnRegister()
+{
+	Super::OnRegister();
+	bEnding = false;
+	// 에디터 월드(BP 미리보기 포함)에도 등록되지만 그 월드에서는 저장이 돌지 않는다. 같은 컴포넌트가 다시 등록돼도 한 번만 든다(AddUnique).
+	UVBSaveParticipantSubsystem::Register(this);
+}
+
+void UVBPlayerRestoreComponent::OnUnregister()
+{
+	bEnding = true;
+	CancelRestoreReceipt();
+	UVBSaveParticipantSubsystem::Unregister(this);
+	Super::OnUnregister();
+}
+
+void UVBPlayerRestoreComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	bEnding = true;
+	CancelRestoreReceipt();
+	Super::EndPlay(EndPlayReason);
+}
+
+void UVBPlayerRestoreComponent::ArmInitialization(FGuid InitializationId)
+{
+	if (bEnding) return;
+	RestoreReceipt = {};
+	RestoreReceipt.InitializationId = InitializationId;
+	if (bRestoring) RestoreReceipt.Outcome = EVBPlayerRestoreOutcome::StartFailed;
+	OnRestoreStateChanged.Broadcast();
+}
+
+void UVBPlayerRestoreComponent::MarkRestoreNotRequired(FGuid InitializationId)
+{
+	if (bEnding || !InitializationId.IsValid() || RestoreReceipt.InitializationId != InitializationId || bRestoring) return;
+	RestoreReceipt.Outcome = EVBPlayerRestoreOutcome::NotRequired;
+	OnRestoreStateChanged.Broadcast();
+}
+
+void UVBPlayerRestoreComponent::SetRestoreOutcome(EVBPlayerRestoreOutcome Outcome)
+{
+	if (RestoreReceipt.InitializationId == RunningInitializationId && RestoreReceipt.OperationId == RunningOperationId)
+	{
+		RestoreReceipt.Outcome = Outcome;
+		RestoreReceipt.bStreamingTimedOut = bStreamingTimedOut;
+	}
+	OnRestoreStateChanged.Broadcast();
+}
+
+void UVBPlayerRestoreComponent::CancelRestoreReceipt()
+{
+	if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(PollTimerHandle);
+	if (!bRestoring)
+	{
+		RestoreReceipt.Outcome = EVBPlayerRestoreOutcome::Cancelled;
+		OnRestoreStateChanged.Broadcast();
+		return;
+	}
+	if (UWorld* World = GetWorld(); World && !World->bIsTearingDown) FreezePawn(false);
+	bRestoring = false;
+	SetRestoreOutcome(EVBPlayerRestoreOutcome::Cancelled);
+}
+
+void UVBPlayerRestoreComponent::WriteSave(UVBSaveGame& Save, const FVBSaveContext& Context)
+{
+	if (Context.Pawn && Context.Pawn == GetOwner())
+	{
+		// 로드 때 WP 스트리밍-안전 복원(BeginRestore)의 목표가 된다. 체크포인트면 지정한 자리(설계 .sw/prologue-opening 3.6a).
+		Save.Progress.SavedPlayerTransform = Context.RestoreTransformOverride.IsSet()
+			? Context.RestoreTransformOverride.GetValue()
+			: Context.Pawn->GetActorTransform();
+		Save.Progress.bHasSavedTransform = true;
+	}
+}
+
+void UVBPlayerRestoreComponent::ReadSave(const UVBSaveGame& Save, const FVBSaveContext& Context)
+{
+	if (bEnding) return;
+	// 위치가 없는 세이브(새 게임 직후·옛 슬롯)는 PlayerStart 스폰을 그대로 둔다.
+	if (Context.Pawn && Context.Pawn == GetOwner())
+	{
+		if (Save.Progress.bHasSavedTransform) BeginRestore(Save.Progress.SavedPlayerTransform);
+		else MarkRestoreNotRequired(RestoreReceipt.InitializationId);
+	}
+}
+
 void UVBPlayerRestoreComponent::BeginRestore(const FTransform& Target)
 {
 	ACharacter* Pawn = Cast<ACharacter>(GetOwner());
 	UWorld* World = GetWorld();
-	if (!Pawn || !World)
+	if (bEnding || !IsRegistered() || !IsValid(Pawn) || Pawn->IsActorBeingDestroyed() || !IsValid(World) || World->bIsTearingDown)
 	{
+		RestoreReceipt.Outcome = EVBPlayerRestoreOutcome::StartFailed;
+		OnRestoreStateChanged.Broadcast();
 		VB_LOG(Warning, "VBPlayerRestoreComponent: 소유 액터가 ACharacter 가 아니거나 월드 없음 -> 복원 스킵");
 		return;
 	}
 	if (bRestoring)
 	{
+		if (RestoreReceipt.InitializationId != RunningInitializationId)
+		{
+			RestoreReceipt.Outcome = EVBPlayerRestoreOutcome::StartFailed;
+			OnRestoreStateChanged.Broadcast();
+		}
 		return; // 진행 중이면 무시(재진입 방지).
 	}
 	bRestoring = true;
+	RunningInitializationId = RestoreReceipt.InitializationId;
+	RunningOperationId = FGuid::NewGuid();
+	RestoreReceipt.OperationId = RunningOperationId;
+	RestoreReceipt.bGroundFound = false;
+	bStreamingTimedOut = false;
+	RestoreReceipt.bStreamingTimedOut = false;
 	PendingTarget = Target;
+	if (UVBPlayerRagdollComponent* Ragdoll = Pawn->FindComponentByClass<UVBPlayerRagdollComponent>())
+		Ragdoll->CancelRagdoll();
+	if (UVBGASPSmartObjectComponent* SmartObject = Pawn->FindComponentByClass<UVBGASPSmartObjectComponent>())
+		SmartObject->AbortInteraction();
 
 	// 1. 저장 XY 로 텔레포트 → 폰이 PlayerController 뷰타겟이라 그 위치 스트리밍이 자동 요청된다.
 	//    Z 는 목표값으로 두되(대략), 실제 지면 정렬은 4단계 라인트레이스가 확정한다.
@@ -46,6 +154,7 @@ void UVBPlayerRestoreComponent::BeginRestore(const FTransform& Target)
 	StreamStartTime = World->GetTimeSeconds();
 	World->GetTimerManager().SetTimer(PollTimerHandle, this, &UVBPlayerRestoreComponent::PollStreaming,
 	                                  FMath::Max(0.02f, PollIntervalSeconds), /*bLoop=*/true);
+	SetRestoreOutcome(EVBPlayerRestoreOutcome::InProgress);
 }
 
 void UVBPlayerRestoreComponent::PollStreaming()
@@ -53,6 +162,8 @@ void UVBPlayerRestoreComponent::PollStreaming()
 	UWorld* World = GetWorld();
 	if (!World)
 	{
+		bRestoring = false;
+		SetRestoreOutcome(EVBPlayerRestoreOutcome::Cancelled);
 		return;
 	}
 
@@ -72,6 +183,7 @@ void UVBPlayerRestoreComponent::PollStreaming()
 	}
 	if (bTimedOut && !bDone)
 	{
+		bStreamingTimedOut = true;
 		VB_LOG(Warning, "VBPlayerRestoreComponent: 스트리밍 완료 대기 타임아웃(%.1fs) -> 강제 지면 스냅", StreamingTimeoutSeconds);
 	}
 
@@ -86,6 +198,7 @@ void UVBPlayerRestoreComponent::SnapToGroundAndFinish()
 	if (!Pawn || !World)
 	{
 		bRestoring = false;
+		SetRestoreOutcome(EVBPlayerRestoreOutcome::Cancelled);
 		return;
 	}
 
@@ -99,7 +212,8 @@ void UVBPlayerRestoreComponent::SnapToGroundAndFinish()
 	FCollisionQueryParams Params;
 	Params.AddIgnoredActor(Pawn);
 	FVector FinalLoc = TargetLoc;
-	if (World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_WorldStatic, Params))
+	const bool bGroundFound = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_WorldStatic, Params);
+	if (bGroundFound)
 	{
 		FinalLoc = FVector(TargetLoc.X, TargetLoc.Y, Hit.ImpactPoint.Z + HalfHeight);
 	}
@@ -108,6 +222,12 @@ void UVBPlayerRestoreComponent::SnapToGroundAndFinish()
 	// 5. 동결 해제 후 완료 통지.
 	FreezePawn(false);
 	bRestoring = false;
+	if (RestoreReceipt.InitializationId == RunningInitializationId && RestoreReceipt.OperationId == RunningOperationId)
+	{
+		RestoreReceipt.bGroundFound = bGroundFound;
+	}
+	SetRestoreOutcome(bStreamingTimedOut ? EVBPlayerRestoreOutcome::StreamingTimedOut
+		: bGroundFound ? EVBPlayerRestoreOutcome::Completed : EVBPlayerRestoreOutcome::GroundNotFound);
 	VB_LOG(Log, "VBPlayerRestoreComponent: 복원 완료 @ %s", *FinalLoc.ToString());
 	OnRestoreCompleted.Broadcast();
 }

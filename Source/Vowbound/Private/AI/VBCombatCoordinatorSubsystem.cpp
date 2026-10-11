@@ -8,6 +8,9 @@
 #include "NavigationSystem.h"
 #include "TimerManager.h"
 #include "AI/VBEnemyCombatComponent.h"
+#include "AbilitySystemComponent.h"        // CancelAbilities - 처형 게이트
+#include "AbilitySystemGlobals.h"          // GetAbilitySystemComponentFromActor
+#include "AbilitySystem/VBGameplayTags.h"  // Ability.Attack
 #include "AbilitySystem/VBAbilitySystemStatics.h"
 #include "Data/VBCombatSettings.h"
 #include "Data/VBEnemyConfig.h"
@@ -142,6 +145,12 @@ bool UVBCombatCoordinatorSubsystem::TryAcquireAttackToken(UVBEnemyCombatComponen
 		? FVector::Dist2D(GrantOwner->GetActorLocation(), GrantTarget->GetActorLocation())
 		: -1.0;
 
+	// 공격을 먼저 고른다(design .sw/boss/design.md §12.7). 이 뒤의 접근 정지 거리·역할 문턱은 «고른 공격의 시작 거리» 를 본다.
+	if (GrantTarget)
+	{
+		Member->PlanNextAttack(GrantTarget->GetActorLocation());
+	}
+
 	VB_LOG(Log, "토큰 부여: %s (코스트 %d, 잔여 %d)",
 	       *GetNameSafe(Member->GetOwner()), EffectiveCost, ComputeAvailableTokens(*Group));
 	return true;
@@ -185,9 +194,23 @@ void UVBCombatCoordinatorSubsystem::ReleaseAttackToken(UVBEnemyCombatComponent* 
 		return;
 	}
 
+	// 계획은 토큰과 수명이 같다. 다음 부여가 그때 거리로 다시 잰다.
+	Member->ClearPlannedAttack();
+
 	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	VB_LOG(Log, "토큰 반납: %s (공격 %.2fs)", *GetNameSafe(Member->GetOwner()),
 	       State->AttackStartedTime >= 0.0 ? Now - State->AttackStartedTime : 0.0);
+	// 숨 (2026-09-06): 방금 끝난 공격의 아키타입이 정한 만큼 다음 부여를 미룬다. 편차는 서버 RNG - 복제 대상이 아니다.
+	if (const UVBEnemyConfig* PauseConfig = Member->GetCombatConfig())
+	{
+		if (PauseConfig->PostAttackPauseSeconds > 0.0f)
+		{
+			const float Pause = FMath::Max(0.0f, PauseConfig->PostAttackPauseSeconds
+				+ FMath::RandRange(-PauseConfig->PostAttackPauseVariance, PauseConfig->PostAttackPauseVariance));
+			Group->NextGrantAllowedTime = FMath::Max(Group->NextGrantAllowedTime, Now + Pause);
+			VB_LOG(Log, "숨: 다음 공격자는 %.2f초 뒤", Pause);
+		}
+	}
 
 	State->ClearLease();
 	// 방금 때린 멤버를 뒤로 보내는 일은 순번 규칙이 위치로 한다(3단계) - 아직 사거리 안이라
@@ -225,19 +248,6 @@ int32 UVBCombatCoordinatorSubsystem::GetHeldTokenCost(const UVBEnemyCombatCompon
 {
 	const FVBCombatMemberState* State = FindMemberState(Member);
 	return State ? State->HeldTokenCost : 0;
-}
-
-int32 UVBCombatCoordinatorSubsystem::GetAvailableTokens(const AActor* Target) const
-{
-	// 맵 키 타입이 TWeakObjectPtr<AActor> 라 const 를 벗겨야 한다. 읽기 전용 조회이므로 안전하다.
-	const TWeakObjectPtr<AActor> TargetKey(const_cast<AActor*>(Target));
-	const FVBCombatGroup* Group = Groups.Find(TargetKey);
-	if (!Group)
-	{
-		// 그룹이 없으면 아무도 안 쥐고 있다 = 총량 전부가 가용이다.
-		return GetDefault<UVBCombatSettings>()->MaxAttackTokens;
-	}
-	return ComputeAvailableTokens(*Group);
 }
 
 int32 UVBCombatCoordinatorSubsystem::ComputeAvailableTokens(const FVBCombatGroup& Group) const
@@ -359,6 +369,45 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 
 	const UWorld* World = GetWorld();
 	const double  Now   = World ? World->GetTimeSeconds() : 0.0;
+
+	// 0) 처형 게이트 (user 결정 2026-09-13: 「맞지 않아야 한다니까 ... 공격 취소가 되어야지 주변 몬스터들은」).
+	//
+	// 대상이 처형을 거는 중이면 이 그룹은 손을 뗀다 - 진행 중인 공격을 끊고, 새 토큰을 안 준다.
+	// 왜 피해 무적이 아니라 여기인가: 무적은 «맞되 피해가 0» 이다. 그러면 적들이 계속 휘두르고
+	//   그 스윙이 처형 연출 위에 겹쳐 보인다. user 가 원한 것은 «애초에 안 때린다» 이고,
+	//   그것을 정하는 곳은 「누가 때릴 수 있나」의 홈인 여기다.
+	// 왜 코디네이터가 «물어보나»: 처형 쪽이 여기를 부르면 처형이 AI 를 알게 된다. 대상 상태는
+	//   태그로 이미 공개돼 있으므로 필요한 쪽이 읽으면 된다 - 새 배선이 안 생긴다.
+	// 왜 그룹을 해산하지 않나: 처형은 3초 남짓이고 끝나면 같은 적들이 그대로 이어서 싸워야 한다.
+	//   여기서 막기만 하면 다음 주기에 저절로 복구된다 - 되돌릴 상태를 안 만든다.
+	if (UVBAbilitySystemStatics::IsActorFinishing(Target))
+	{
+		for (TPair<TWeakObjectPtr<UVBEnemyCombatComponent>, FVBCombatMemberState>& Pair : Group.Members)
+		{
+			UVBEnemyCombatComponent* Member = Pair.Key.Get();
+			AActor* MemberOwner = Member ? Member->GetOwner() : nullptr;
+			if (!MemberOwner)
+			{
+				continue;
+			}
+
+			// 예고 중이든 스윙 중이든 끊는다. 예고만 끊으면 이미 뽑은 칼이 연출 위로 내려온다.
+			if (UAbilitySystemComponent* MemberASC =
+			        UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(MemberOwner))
+			{
+				FGameplayTagContainer AttackTags;
+				AttackTags.AddTag(VBGameplayTags::Ability_Attack);
+				MemberASC->CancelAbilities(&AttackTags);
+			}
+
+			// 토큰을 회수한다. 안 그러면 처형이 끝난 뒤 그 멤버가 쥔 채로 남아 다음 배분이 막힌다.
+			if (Pair.Value.HeldTokenCost > 0)
+			{
+				ReleaseAttackToken(Member);
+			}
+		}
+		return;
+	}
 
 	// 1) 정리 - 무효/사망 멤버 제거 + 토큰 임대 만료 회수
 	for (auto It = Group.Members.CreateIterator(); It; ++It)
@@ -492,7 +541,7 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 			const UVBEnemyCombatComponent* Member = Candidate.Get();
 			const AActor* MemberOwner = Member ? Member->GetOwner() : nullptr;
 			if (MemberOwner &&
-			    FVector::Dist2D(MemberOwner->GetActorLocation(), TargetLocation) <= Member->GetCombatConfig()->AttackCommitDistance)
+			    FVector::Dist2D(MemberOwner->GetActorLocation(), TargetLocation) <= Member->GetAttackStartDistance())
 			{
 				bAnyCandidateInRange = true;
 				break;
@@ -511,7 +560,7 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 					continue;
 				}
 				const double Distance = FVector::Dist2D(MemberOwner->GetActorLocation(), TargetLocation);
-				if (Distance <= Member->GetCombatConfig()->AttackReleaseDistance)
+				if (Distance <= Member->GetAttackReleaseDistance())
 				{
 					continue;
 				}
@@ -536,6 +585,41 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 
 				// 뺏긴 멤버도 남으면 도로 받는다. 다른 후보 뒤에 세우는 이유는 2.5 와 같다 -
 				// 앞에 두면 그가 사거리 밖이라 정렬 1순위가 되어 곧바로 되찾는다.
+				if (Member->IsReadyToAttack())
+				{
+					Deprioritized.Add(Pair.Key);
+				}
+			}
+		}
+	}
+
+	// 2.7) 슈퍼아머 반격 요청 회수 (2026-09-06, design .sw/enemy-soldier/design.md §3.4).
+	//   연속으로 맞은 멤버가 반격을 원하는데 토큰이 «아직 공격에 들어가지 않은» 보유자 손에 있으면 회수해 넘긴다.
+	//   스윙 중인 보유자는 뺏지 않는다(2.5·2.6 과 같은 안전선) - 반격은 그 스윙이 끝난 뒤 4단계에서 1순위로 받는다.
+	//   토큰을 아예 건너뛰지 않는 이유: «한 번에 하나» 가 깨지면 «다같이 때리는 기분»(design §10)이 돌아온다.
+	if (Candidates.Num() > 0)
+	{
+		bool bAnyCounterRequest = false;
+		for (const TWeakObjectPtr<UVBEnemyCombatComponent>& Candidate : Candidates)
+		{
+			if (const UVBEnemyCombatComponent* Member = Candidate.Get(); Member && Member->WantsArmoredCounter())
+			{
+				bAnyCounterRequest = true;
+				break;
+			}
+		}
+		if (bAnyCounterRequest)
+		{
+			for (TPair<TWeakObjectPtr<UVBEnemyCombatComponent>, FVBCombatMemberState>& Pair : Group.Members)
+			{
+				UVBEnemyCombatComponent* Member = Pair.Key.Get();
+				FVBCombatMemberState&    State  = Pair.Value;
+				if (!Member || State.HeldTokenCost <= 0 || State.AttackStartedTime >= 0.0)
+				{
+					continue;
+				}
+				VB_LOG(Log, "토큰 재배분: %s - 슈퍼아머 반격 요청자에게 넘긴다(접근 중이던 임대 회수)", *GetNameSafe(Member->GetOwner()));
+				State.ClearLease();
 				if (Member->IsReadyToAttack())
 				{
 					Deprioritized.Add(Pair.Key);
@@ -620,6 +704,10 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 	//
 	// 잠긴 동안 아무것도 기억하지 않는다: 예고가 끝나면 다음 주기에 같은 후보들이 그대로 다시 모이고,
 	//   순서는 3단계의 위치 규칙이 매번 다시 정한다.
+	// 3.6) 숨 게이트 (2026-09-06): 직전 공격이 끝난 뒤 그 아키타입의 숨이 지나기 전에는 토큰을 주지 않는다.
+	//   예고 게이트가 «읽을 것이 겹치지 않게» 를 맡고, 이 게이트가 «스윙 사이 빈 시간» 을 맡는다.
+	const double NowForPause = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	const bool   bInPause    = NowForPause < Group.NextGrantAllowedTime;
 	bool bAnyTelegraphing = false;
 	for (const TPair<TWeakObjectPtr<UVBEnemyCombatComponent>, FVBCombatMemberState>& Pair : Group.Members)
 	{
@@ -631,14 +719,30 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 		}
 	}
 
+	// 3.7) 슈퍼아머 반격 요청자를 맨 앞으로 (design .sw/enemy-soldier/design.md §3.4). 순번 규칙(위치)보다 앞선다 -
+	//   «맞다가 핑» 은 맞은 그 적이 해야 뜻이 선다. 안정 정렬이라 요청자끼리·나머지끼리의 순서는 3단계 그대로다.
+	Candidates.StableSort([](const TWeakObjectPtr<UVBEnemyCombatComponent>& A, const TWeakObjectPtr<UVBEnemyCombatComponent>& B)
+	{
+		const UVBEnemyCombatComponent* MemberA = A.Get();
+		const UVBEnemyCombatComponent* MemberB = B.Get();
+		const bool bACounter = MemberA && MemberA->WantsArmoredCounter();
+		const bool bBCounter = MemberB && MemberB->WantsArmoredCounter();
+		return bACounter && !bBCounter;
+	});
+
 	// 4) 배분(push). 부여의 구현은 TryAcquireAttackToken 하나뿐이라 "토큰을 준다"의 홈이 하나다.
-	//    예고 게이트가 걸려 있으면 이번 주기는 통째로 건너뛴다.
+	//    예고 게이트가 걸려 있으면 이번 주기는 통째로 건너뛴다. 숨 게이트는 슈퍼아머 반격 요청자에게는 적용하지 않는다 -
+	//    숨은 리듬이고 반격은 벌이라, 숨을 기다리면 «핑» 이 늦어 맞은 것과 반격이 이어져 보이지 않는다.
 	for (const TWeakObjectPtr<UVBEnemyCombatComponent>& Candidate : bAnyTelegraphing
 		     ? TArray<TWeakObjectPtr<UVBEnemyCombatComponent>>()
 		     : Candidates)
 	{
 		UVBEnemyCombatComponent* Member = Candidate.Get();
 		if (!Member)
+		{
+			continue;
+		}
+		if (bInPause && !Member->WantsArmoredCounter())
 		{
 			continue;
 		}
@@ -670,10 +774,10 @@ void UVBCombatCoordinatorSubsystem::RecomputeGroup(FVBCombatGroup& Group)
 		}
 		else
 		{
-			const UVBEnemyConfig* Config = Member->GetCombatConfig();
+			// 계획된 공격이 있으면 그 시작 거리가 문턱이다(design §12.7). 없으면 자산의 Commit/Release 그대로.
 			const double Threshold = (State.Role == EVBCombatRole::Attacker)
-				                         ? Config->AttackReleaseDistance
-				                         : Config->AttackCommitDistance;
+				                         ? Member->GetAttackReleaseDistance()
+				                         : Member->GetAttackStartDistance();
 			State.Role = (Distance <= Threshold) ? EVBCombatRole::Attacker : EVBCombatRole::Approaching;
 		}
 

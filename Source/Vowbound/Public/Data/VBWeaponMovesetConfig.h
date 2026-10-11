@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "Character/VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "VBWeaponMovesetConfig.generated.h"
 
 class UVBAttackConfig;

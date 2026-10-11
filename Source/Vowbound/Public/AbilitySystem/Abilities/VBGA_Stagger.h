@@ -18,7 +18,7 @@ class UVBHitReactConfig;
  *              Event.Combat.PoiseBroken 을 HandleGameplayEvent 로 송신 → 아래 AbilityTriggers 가 수신.
  *              (UVBGA_HitReact 가 Event.Combat.Hit 로 활성화되는 것과 정확히 같은 구조)
  *
- * 왜 히트리액트와 같은 클래스로 합치지 않는가: 트리거(Hit vs PoiseBroken), 게이트(뚝심 vs 회피/가드),
+ * 왜 히트리액트와 같은 클래스로 합치지 않는가: 트리거(Hit vs PoiseBroken), 게이트(슈퍼아머 vs 회피/가드),
  *   강도(플린치 vs 큰 경직)가 전부 다르다. 같은 클래스로 합치면 그 셋을 런타임 분기로 갈라야 하고,
  *   분기 조건이 곧 두 번째 홈이 된다.
  *
@@ -45,6 +45,12 @@ protected:
 	                            const FGameplayAbilityActorInfo*     ActorInfo,
 	                            const FGameplayAbilityActivationInfo ActivationInfo,
 	                            const FGameplayEventData*            TriggerEventData) override;
+
+	// 처형 창 GA 가 켜져 있으면(State.Combat.FinisherWindowArmed) 기절 게이지 소진을 받지 않는다 - 창이 곧 무력한 상태이고, 받으면
+	//   마무리 타의 반응을 끊은 뒤 창에 끊겨 한 프레임짜리 기절이 된다. 파생(UVBGA_Knockdown)이 Super 로 부르므로 넘어짐의 기절 게이지 경로도 같다.
+	//   넘어뜨리는 타격(Event.Combat.KnockedDown)은 여기서 거르지 않는다 - 그래서 ActivationBlockedTags 가 아니라 이벤트 판정이다.
+	virtual bool ShouldAbilityRespondToEvent(const FGameplayAbilityActorInfo* ActorInfo,
+	                                         const FGameplayEventData*        Payload) const override;
 
 private:
 	// 몽타주 종료 4경로(완료/블렌드아웃/중단/취소) 공통 종료 — 경직은 경로별 분기가 필요 없다.

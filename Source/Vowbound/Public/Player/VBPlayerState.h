@@ -6,6 +6,7 @@
 #include "GameFramework/PlayerState.h"
 #include "AbilitySystemInterface.h"
 #include "AttributeSet.h"                 // FGameplayAttribute — TArray 멤버라 전방선언 불가
+#include "SaveSystem/VBSaveParticipant.h" // 빌드 구역의 저장 참여자
 #include "VBPlayerState.generated.h"
 
 // 전방선언 (헤더 include 최소화)
@@ -13,6 +14,10 @@ class UVBAbilitySystemComponent;
 class UVBHealthAttributeSet;
 class UVBCombatAttributeSet;
 class UVBReputationAttributeSet;
+class UVBInventoryComponent;
+class UVBEquipmentComponent;
+class UVBProgressionComponent;
+class UVBQuestLogComponent;
 class UGameplayAbility;
 class UGameplayEffect;
 struct FVBPlayerBuildSaveData;
@@ -22,14 +27,25 @@ struct FVBPlayerBuildSaveData;
  * 이유 : Respawn 시 Attribute 유지, 네트워크 안정성
  */
 UCLASS()
-class VOWBOUND_API AVBPlayerState : public APlayerState, public IAbilitySystemInterface
+class VOWBOUND_API AVBPlayerState : public APlayerState, public IAbilitySystemInterface, public IVBSaveParticipant
 {
 	GENERATED_BODY()
-	
+
 public:
 	AVBPlayerState();
-	
+
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+
+	//~ IVBSaveParticipant - 빌드 구역(UVBSaveGame::PlayerBuild). 문맥의 PlayerState 가 자기일 때만(리슨 서버의 다른 플레이어 것은 안 쓴다).
+	virtual void WriteSave(UVBSaveGame& Save, const FVBSaveContext& Context) override;
+	virtual void ReadSave(const UVBSaveGame& Save, const FVBSaveContext& Context) override;
+
+protected:
+	// 저장 참여 등록은 BeginPlay 가 아니라 여기 - Continue 적용이 월드 BeginPlay 보다 먼저 온다(IVBSaveParticipant 주석).
+	virtual void PostInitializeComponents() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+public:
 	
 	// 커스텀 ASC 접근자 (다운 캐스트 없이 바로 사용)
 	UVBAbilitySystemComponent* GetVBAbilitySystemComponent() const;
@@ -97,7 +113,23 @@ protected:
 
 	UPROPERTY()
 	TObjectPtr<UVBReputationAttributeSet> ReputationAttributeSet;
-	
+
+	// 가진 아이템의 주인(.sw/narrative 10.2). 폰이 죽고 다시 나도 남는다. 찾기 = UVBInventoryComponent::FindFor.
+	UPROPERTY(VisibleAnywhere, Category="Vowbound|Item")
+	TObjectPtr<UVBInventoryComponent> InventoryComponent;
+
+	// 입은 장비의 주인(.sw/remaining-features/b1-equipment.md). 인벤토리·ASC 와 같은 자리라 폰이 바뀌어도 장비와 효과가 남는다. 찾기 = UVBEquipmentComponent::FindFor.
+	UPROPERTY(VisibleAnywhere, Category="Vowbound|Item")
+	TObjectPtr<UVBEquipmentComponent> EquipmentComponent;
+
+	// 성장(경험치·레벨·스킬 트리)의 주인(.sw/remaining-features/b2-growth.md). 같은 자리라 죽고 다시 나도 남는다. 찾기 = UVBProgressionComponent::FindFor.
+	UPROPERTY(VisibleAnywhere, Category="Vowbound|Growth")
+	TObjectPtr<UVBProgressionComponent> ProgressionComponent;
+
+	// 퀘스트 진행의 주인(.sw/narrative 12.2). 인벤토리와 같은 이유로 PlayerState 에 둔다. 찾기 = UVBQuestLogComponent::FindFor.
+	UPROPERTY(VisibleAnywhere, Category="Vowbound|Quest")
+	TObjectPtr<UVBQuestLogComponent> QuestLogComponent;
+
 	// GAS를 주었는지에 대한 플래그
 	bool bStartupAbilitiesGranted = false;
 	bool bStartupEffectsApplied = false;

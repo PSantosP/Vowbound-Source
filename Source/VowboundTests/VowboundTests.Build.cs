@@ -7,6 +7,7 @@ public class VowboundTests : ModuleRules
 	public VowboundTests(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		PrivateDependencyModuleNames.Add("AnimationWarpingRuntime");
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
@@ -26,6 +27,12 @@ public class VowboundTests : ModuleRules
 
 			// FGameplayAttribute (AVBPlayerState::SavedAttributes 세이브 키 계약 테스트)
 			"GameplayAbilities",
+
+			// 런타임 모듈에서 옮겨 온 시험이 직접 쓰는 모듈 (2026-10-02, 구조 정리 1a).
+			// Vowbound 가 공개 의존으로 이미 끌고 오지만, 시험이 직접 include·생성하는 모듈은 여기 적는다 -
+			// 그래야 Vowbound 의 의존이 바뀌어도 시험이 조용히 깨지지 않는다.
+			"GameplayCameras", // UGameplayCameraComponent, UCameraAsset (VBEnvironmentCameraPolicyTests)
+			"InputCore",       // EKeys (VBTargetLockPolicyTests)
 
 			// 검증 대상 게임 모듈 (VOWBOUND_API export 확인 완료, E20)
 			"Vowbound",

@@ -45,6 +45,8 @@ public:
 	void ApplyLookSettings(float InLookSensitivity, bool bInInvertYAxis);
 
 protected:
+	virtual void NativeOnInitialized() override;
+
 	// UMG 이름 바인딩. WBP 의 위젯 이름이 이 필드명과 같으면 엔진이 자동으로 물려 준다.
 	// Optional 인 이유: 바인딩이 끊겨도 컴파일은 통과시키고 런타임에 로그로 알린다 - 필수(BindWidget)로
 	//   두면 이름을 바꾸는 순간 WBP 가 컴파일 불가가 되어 편집 중 화면을 못 연다.
@@ -54,4 +56,12 @@ protected:
 
 	UPROPERTY(meta=(BindWidgetOptional))
 	TObjectPtr<class UCheckBox> ChkInvertY;
+
+	// «조작» - 키 다시 지정 화면(UI.Screen.KeyBindings)을 연다. 설정 페이지를 메인 메뉴·일시정지 메뉴가 같이 쓰므로 둘 다에서 열린다.
+	UPROPERTY(meta=(BindWidgetOptional))
+	TObjectPtr<class UButton> BtnControls;
+
+private:
+	UFUNCTION()
+	void HandleControlsClicked();
 };

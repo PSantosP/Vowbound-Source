@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
+#include "AbilitySystem/VBHitImpact.h" // EVBHitImpact (스윙 단위 등급 덮어쓰기)
 #include "VBSwingCombatProfile.generated.h"
 
 class FDataValidationContext; // IsDataValid 인자 — 헤더에서 Misc/DataValidation.h 를 끌지 않는다(VBSwingImpactProfile.h 동형)
@@ -86,6 +87,16 @@ class VOWBOUND_API UVBSwingCombatProfile : public UPrimaryDataAsset
 public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Combat")
 	FVBSwingCombatScales Scales;
+
+	// 이 스윙만 반응 등급을 바꾼다(DEC-025) - 「콤보 마지막 타만 넘어뜨린다」.
+	// 왜 배율이 아니라 덮어쓰기 표지인가: 등급은 범주값이라 항등원이 없다. 표지가 꺼져 있으면 무기 leaf 의
+	//   UVBAttackConfig::HitImpact 를 그대로 쓴다 - 미저작 = 현행이라는 이 자산의 규약은 표지로 지킨다.
+	// 위 Scales 와 같은 자산에 두는 이유: 「이 타만 더 아프게 / 더 밀리게 / 더 오래 멈추게」와 같은 입도(스윙)이고 같은 독자(GA)다.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Combat", meta=(InlineEditConditionToggle))
+	bool bOverrideHitImpact = false;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Vowbound|Combat", meta=(EditCondition="bOverrideHitImpact"))
+	EVBHitImpact HitImpact = EVBHitImpact::Light;
 
 #if WITH_EDITOR
 	// 전 배율이 1.0 인 자산을 저장 시점에 잡는다.

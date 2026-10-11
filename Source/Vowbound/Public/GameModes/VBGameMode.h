@@ -8,6 +8,7 @@
 #include "VBGameMode.generated.h"
 
 class AVBGameState;
+class UVBCinematicDefinition;
 
 /**
  * Vowbound 기본 GameMode. 매치 규칙과 스폰 정책을 관리한다.
@@ -27,6 +28,12 @@ protected:
 	// 왜 여기: OpenLevel 이 월드를 파괴하므로 GI 수명 세이브 서브시스템의 '적용 대기' 플래그를
 	//          새 레벨에서 처음 폰이 생기는 이 지점이 소비한다. New Game 은 플래그가 없어 기본 상태 유지.
 	virtual void HandleStartingNewPlayer_Implementation(APlayerController* NewPlayer) override;
+
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Cinematic")
+	bool bPlayInitialNewGameCinematic = false;
+
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Cinematic")
+	TObjectPtr<UVBCinematicDefinition> InitialNewGameCinematic;
 	
 	// 음수 방지를 위해 ClampMin을 0으로
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|CoreLoop", meta=(ClampMin = "0"))

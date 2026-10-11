@@ -5,11 +5,13 @@
 #include "TimerManager.h"
 #include "GameModes/VBGameState.h"
 #include "SaveSystem/VBSaveGameSubsystem.h"
-#include "SaveSystem/VBSaveGame.h"
-#include "SaveSystem/VBPlayerRestoreComponent.h"
-#include "Player/VBPlayerState.h"
+#include "SaveSystem/VBSaveParticipant.h"
+#include "Player/VBPlayerReadinessComponent.h"
+#include "Narrative/Cinematic/VBCinematicStartupPolicy.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"
 #include "GameFramework/Pawn.h"
+#include "Engine/World.h"
 #include "Vowbound/Vowbound.h"
 
 AVBGameMode::AVBGameMode()
@@ -32,34 +34,54 @@ void AVBGameMode::HandleStartingNewPlayer_Implementation(APlayerController* NewP
 
 	// Continue(세이브 로드) 로 진입한 경우에만 적용. New Game / 무세이브면 플래그가 없어 기본 상태를 유지한다.
 	UVBSaveGameSubsystem* Save = UVBSaveGameSubsystem::Get(this);
+	const FVBGameStartContext Start = Save ? Save->GetGameStartContext() : FVBGameStartContext();
+	const TWeakObjectPtr<APawn> StartingPawn = IsValid(NewPlayer) ? NewPlayer->GetPawn() : nullptr;
+	const TWeakObjectPtr<UVBPlayerReadinessComponent> Readiness = StartingPawn.IsValid()
+		? StartingPawn->FindComponentByClass<UVBPlayerReadinessComponent>() : nullptr;
+	const auto CompletePreparation = [&](bool bContinueDispatched)
+	{
+		if (Readiness.IsValid() && StartingPawn.IsValid() && IsValid(NewPlayer)
+			&& NewPlayer->GetPawn() == StartingPawn.Get() && StartingPawn->GetController() == NewPlayer
+			&& StartingPawn->GetWorld() == GetWorld())
+		{
+			Readiness->CompleteInitialization(Start.AttemptId, bContinueDispatched);
+		}
+	};
+	if (Readiness.IsValid()) Readiness->BeginInitialization(Start.AttemptId, Start.Intent);
 	if (!Save || !Save->ConsumePendingContinueApply())
 	{
-		return;
-	}
-	UVBSaveGame* Game = Save->GetActiveGameSave();
-	if (!Game || !NewPlayer)
-	{
-		return;
-	}
-
-	// 빌드/스탯 적용(즉시) — 어트리뷰트 base 값 세팅 + 무기 재소환.
-	if (AVBPlayerState* PS = NewPlayer->GetPlayerState<AVBPlayerState>())
-	{
-		PS->ApplyBuild(Game->PlayerBuild);
-	}
-
-	// 위치 복원(WP 스트리밍-안전, 지연) — 저장된 Transform 이 있을 때만.
-	if (Game->Progress.bHasSavedTransform)
-	{
-		if (APawn* Pawn = NewPlayer->GetPawn())
+		if (bPlayInitialNewGameCinematic && Save && Start.Intent == EVBGameStartIntent::NewGame
+			&& Save->ConsumeInitialNewGameStart(Start.AttemptId))
 		{
-			if (UVBPlayerRestoreComponent* Restore = Pawn->FindComponentByClass<UVBPlayerRestoreComponent>())
+			if (UVBCinematicStartupPolicy* Policy = GetWorld()->GetSubsystem<UVBCinematicStartupPolicy>())
 			{
-				Restore->BeginRestore(Game->Progress.SavedPlayerTransform);
+				Policy->BeginNewGameCinematic(NewPlayer, InitialNewGameCinematic, Start.AttemptId);
 			}
+			// 시작 거절도 완료가 아니다. 이 최초 시도의 초기화는 정책만 끝낸다.
+			return;
 		}
+		CompletePreparation(false);
+		return;
 	}
-	VB_LOG(Log, "AVBGameMode: Continue 적용 완료(bHasSavedTransform=%d)", Game->Progress.bHasSavedTransform ? 1 : 0);
+	if (!IsValid(NewPlayer))
+	{
+		return;
+	}
+	// Initialization notifications may synchronously replace the pawn or start a different game.
+	if (Save->GetGameStartContext().AttemptId != Start.AttemptId || NewPlayer->GetPawn() != StartingPawn.Get()) return;
+
+	// 참여자가 각자 자기 구역을 적용한다 - 빌드(AVBPlayerState), 문·스위치(UVBInteractableSubsystem, 스트리밍으로 들어올 것은 등록될 때),
+	//   위치(UVBPlayerRestoreComponent, WP 스트리밍을 기다려 늦게), 사실(UVBStoryStateComponent). 설계 .sw/narrative 9.3절.
+	// 이 자리가 Super(스폰·빙의 = GE_InitStats) 뒤라는 것이 빌드 복원의 전제다(AVBPlayerState::ClampToCap).
+	FVBSaveContext Context;
+	Context.World = GetWorld();
+	Context.PlayerController = NewPlayer;
+	Context.Pawn = NewPlayer->GetPawn();
+	Context.PlayerState = NewPlayer->PlayerState;
+	const int32 Applied = Save->ApplyActiveSave(Context);
+	// «적용 완료» 라고 쓰지 않는다 - 수는 건넨 참여자 수다. 적용 거절은 참여자가 각자 경고한다(UVBSaveParticipantSubsystem::ReadAll).
+	VB_LOG(Log, "AVBGameMode: Continue 세이브를 참여자 %d 에게 건넸다", Applied);
+	CompletePreparation(Applied > 0);
 }
 
 void AVBGameMode::StartPhase(EVBMatchPhase NewPhase, int32 DurationSec)

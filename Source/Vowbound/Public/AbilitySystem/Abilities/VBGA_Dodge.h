@@ -33,6 +33,9 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Dodge")
 	TObjectPtr<UVBDodgeConfig> DodgeConfig;
 	FTimerHandle DodgeTimerHandle;
+	// 회피 커밋(AttackCancelSeconds)은 이 GA 가 아니라 AVBCharacter 가 쥔다(BeginDodgeCommit/CancelDodgeCommit).
+	//   왜: UGameplayAbility::EndAbility 가 ClearAllTimersForObject(this) 를 부른다(GameplayAbility.cpp, CVar AbilitySystem.ClearAbilityTimers 기본 켬).
+	//   커밋(0.45)이 무적(0.4)보다 길어 GA 에 건 타이머는 EndAbility 에서 지워지고 태그가 영원히 남았다(2026-09-05 user 「그 이후로 공격이 안 된다」).
 	
 private:
 	/**

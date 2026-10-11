@@ -2,7 +2,7 @@
 
 #include "AbilitySystem/GameplayCues/VBGC_HitFlash.h"
 
-#include "Character/VBHitFlashComponent.h"
+#include "CharacterCommon/VBHitFlashComponent.h"
 #include "GameFramework/Actor.h"
 #include "Vowbound/Vowbound.h"
 

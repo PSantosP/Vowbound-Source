@@ -5,10 +5,30 @@
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "SaveSystem/VBSaveGameTypes.h"
+#include "SaveSystem/VBSaveHold.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Kismet/GameplayStatics.h"
+#endif
 #include "VBSaveGameSubsystem.generated.h"
 
 class UVBSaveGame;
 class APawn;
+struct FVBSaveContext;
+
+// 체크포인트가 쓸 슬롯(.sw/prologue-opening 3.6a, f3 검증 10-07): 활성 슬롯 -> 빈 슬롯 -> 둘 다 없으면 INDEX_NONE(거절).
+//   일반 저장의 ResolveSaveSlot 과 달리 만석이어도 0번을 덮지 않는다 - 체크포인트는 user 가 고르지 않은 자동 저장이라 남의 세이브를 덮으면 안 된다.
+namespace VBSaveSlotPolicy
+{
+	VOWBOUND_API int32 ResolveCheckpointSlot(int32 ActiveSlot, const TArray<FVBSaveSlotMeta>& Slots);
+}
+
+enum class EVBGameStartIntent : uint8 { Unknown, NewGame, Continue };
+
+struct FVBGameStartContext
+{
+	FGuid AttemptId;
+	EVBGameStartIntent Intent = EVBGameStartIntent::Unknown;
+};
 
 // 게임 슬롯 저장/로드 완료 통지. (슬롯 인덱스, 성공 여부)
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVBOnGameSaveCompleted, int32, SlotIndex, bool, bSuccess);
@@ -121,6 +141,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Save")
 	bool ConsumePendingContinueApply();
 
+	// Explicit producer receipt; consuming the legacy bool does not change its identity.
+	FVBGameStartContext GetGameStartContext() const { return GameStartContext; }
+	bool ConsumeInitialNewGameStart(FGuid AttemptId);
+	FSimpleMulticastDelegate OnGameStartContextChanged;
+
+	FVBSaveHoldToken BeginSaveHold(FName Reason);
+	bool EndSaveHold(const FVBSaveHoldToken& Token);
+	bool IsGameSaveHeld() const { return SaveHolds.IsHeld(); }
+	bool IsSaveHoldActive(const FVBSaveHoldToken& Token) const { return !bStopping && SaveHolds.Contains(Token); }
+	FSimpleMulticastDelegate OnSaveHoldsChanged;
+	DECLARE_MULTICAST_DELEGATE_TwoParams(FOnGameSaveRefused, int32, FName);
+	FOnGameSaveRefused OnGameSaveRefused;
+
 	// 활성 슬롯에 현재 활성 세이브를 저장(비동기). SaveCurrentGame 경유로 스냅샷까지 수행(로컬 폰 해석).
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Save")
 	void SaveCurrentSlot();
@@ -131,12 +164,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Save")
 	void SaveCurrentGame(APawn* Pawn);
 
-	// 지정한 슬롯에 현재 플레이어 상태(위치/빌드) 스냅샷을 조립해 저장(비동기). 단일 권위 저장경로.
+	// 지정한 슬롯에 현재 상태 스냅샷을 조립해 저장(비동기). 단일 권위 저장경로.
+	// 무엇을 담는지는 이 함수가 모른다 - 폰의 월드에 등록된 저장 참여자(IVBSaveParticipant)가 각자 자기 구역을 쓴다(설계 .sw/narrative 9.3절).
 	// 저장 후 그 슬롯이 활성 슬롯이 된다 - 이어지는 저장/Continue 가 같은 자리를 가리켜야 한다.
 	// 반환값 = 비동기 저장을 실제로 걸었는지. false 면 OnGameSaveCompleted 가 오지 않으므로,
 	//   완료를 기다리려는 호출자는 이 값을 보고 구독해야 한다(영영 안 오는 구독 방지).
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Save")
 	bool SaveCurrentGameToSlot(APawn* Pawn, int32 SlotIndex);
+
+	// 체크포인트 저장(설계 .sw/prologue-opening 3.6a): 지금 상태를 쓰되, 불러올 때 돌아올 자리는 RestoreAt 이다.
+	//   슬롯은 SaveCurrentGame 과 같이 해석한다. 완료는 다른 저장과 같은 OnGameSaveCompleted 로 오고 HUD 가 알린다 -
+	//   이 저장의 완료를 기다리는 게임 규칙은 두지 않는다(첫 조우 준비는 저장 성공을 조건으로 삼지 않는다, 설계 8.2·8.6).
+	//   반환값 = 비동기 저장을 실제로 걸었는지(SaveCurrentGameToSlot 과 같다).
+	bool SaveCheckpoint(APawn* Pawn, const FTransform& RestoreAt);
+
+	// 활성 세이브(Continue 로 불러온 것)를 문맥 월드의 저장 참여자들에게 적용한다. AVBGameMode 가 스폰·빙의 직후 부른다 -
+	//   GE_InitStats 가 이미 걸린 뒤라야 빌드 복원이 상한을 안다(AVBPlayerState::ClampToCap). 반환 = 적용한 참여자 수(0 이면 오류 로그).
+	int32 ApplyActiveSave(const FVBSaveContext& Context);
 
 	// 슬롯 인덱스 → 슬롯 문자열 이름 ("VBGameSave_<N>").
 	UFUNCTION(BlueprintPure, Category="Vowbound|Save")
@@ -179,6 +223,28 @@ public:
 	FVBOnGameLoadCompleted OnGameLoadCompleted;
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+	friend class FVBSaveGateTestAccess;
+	TFunction<void(UVBSaveGame*, const FString&, int32, const FAsyncSaveGameToSlotDelegate&)> TestSaveDispatch;
+	TFunction<void(const FString&, int32)> TestDeleteDispatch;
+#endif
+	bool CanWriteSlot(int32 SlotIndex);
+	void FlushSaveToSlot(UVBSaveGame* Snapshot, int32 SlotIndex);
+	FGuid BeginNewGame(int32 SlotIndex);
+	void NotifySaveHoldsChanged();
+	FVBSaveHoldSet SaveHolds;
+	TMap<int32, FGuid> PendingWrites;
+	FGuid PendingLoadId;
+	FGuid ConsumedNewGameAttempt;
+	uint64 SaveGateRevision = 0;
+	bool bSavingSnapshot = false;
+	bool bCompletingSave = false;
+	bool bChangingStartContext = false;
+	bool bStopping = false;
+	FVBGameStartContext GameStartContext;
+	// 저장의 단 하나의 몸통 - 참여자에게 쓰게 하고 비동기로 내보낸다. SaveCurrentGameToSlot·SaveCheckpoint 가 문맥만 다르게 부른다.
+	bool WriteContextToSlot(const FVBSaveContext& Context, int32 SlotIndex);
+
 	// 메뉴에 노출할 게임 슬롯 수. 확장 시 UDeveloperSettings 로 외부화.
 	static constexpr int32 MaxSlotCount = 3;
 

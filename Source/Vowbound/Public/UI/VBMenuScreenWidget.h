@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/VBScreenWidget.h"
 #include "UI/VBSaveSlotListWidget.h"
 #include "VBMenuScreenWidget.generated.h"
 
@@ -14,7 +14,7 @@
  *       전환 규약을 여기 하나에 둔다. 각 메뉴는 자기만의 페이지를 2번부터 덧붙인다.
  */
 UCLASS(Abstract)
-class VOWBOUND_API UVBMenuScreenWidget : public UUserWidget
+class VOWBOUND_API UVBMenuScreenWidget : public UVBScreenWidget
 {
 	GENERATED_BODY()
 
@@ -44,6 +44,15 @@ protected:
 
 	// 공통 전환. 스위처가 없으면 경고 후 false - 조용히 아무 일도 없으면 UI 버그로 오진한다.
 	bool SwitchToPage(int32 PageIndex);
+
+	// 뒤로 가기(Esc·게임패드 B): 하위 페이지(설정·슬롯)에 있으면 첫 화면으로만 돌아간다.
+	//   첫 화면이면 부모에 맡긴다 - 뒤로 가기를 받는 화면(bIsBackHandler)이면 화면을 닫는다.
+	//   이렇게 안 하면 일시정지 메뉴의 설정 페이지에서 Esc 를 누를 때 메뉴가 통째로 닫힌다.
+	virtual bool NativeOnHandleBackAction() override;
+
+	// 화면이 켜질 때마다 첫 페이지에서 시작한다. 화면 위젯은 재사용되므로(부모 클래스 주석)
+	//   안 그러면 지난번에 닫힌 페이지(설정 등)로 다시 열린다.
+	virtual void NativeOnActivated() override;
 
 	// UMG 이름 바인딩(WBP 위젯 이름 == 필드명). 노출 키워드가 없으므로 Category 를 붙이지 않는다.
 	UPROPERTY(meta=(BindWidgetOptional))

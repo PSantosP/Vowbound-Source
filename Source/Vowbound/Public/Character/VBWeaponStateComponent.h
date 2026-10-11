@@ -3,13 +3,36 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "VBWeaponStateTypes.h"
+#include "Types/VBWeaponStateTypes.h"
 #include "Components/ActorComponent.h"
 #include "VBWeaponStateComponent.generated.h"
 
 class AVBCharacter;
 class UAbilitySystemComponent;
 class UVBWeaponStateConfig;
+class UVBFinisherConfig;
+
+// 무기 주기의 결과(.sw/prologue-opening 10절). 획득 효과(체크포인트·대사·사실)는 NewlyOwned 일 때만 건다 -
+//   이미 가진 무기를 다른 자리에서 또 집어도 그것들이 다시 돌지 않게.
+UENUM()
+enum class EVBWeaponGrantResult : uint8
+{
+	NewlyOwned,
+	AlreadyOwned,
+	Failed,
+};
+
+DECLARE_MULTICAST_DELEGATE(FVBOnOwnedWeaponsChanged);
+
+// 가진 무기 판단 - 컴포넌트 상태와 떼어 둔 순수 함수. 단위 시험(Vowbound.Unit.Weapon.Ownership)이 잰다.
+namespace VBWeaponOwnership
+{
+	// 재발도할 무기: 선택 -> 마지막 사용 -> 기본 순서로 «가진 것» 중 첫째, 셋 다 안 가졌으면 가진 것의 첫째, 하나도 없으면 None.
+	VOWBOUND_API EVBWeaponType PickResummon(EVBWeaponType Current, EVBWeaponType LastUsed, EVBWeaponType Default, const TArray<EVBWeaponType>& Owned);
+
+	// 주기. Known = 데이터가 있는 무기(WeaponDataMap 의 열쇠). None·모르는 무기는 Failed, 이미 있으면 AlreadyOwned(목록 그대로).
+	VOWBOUND_API EVBWeaponGrantResult Grant(TArray<EVBWeaponType>& Owned, const TArray<EVBWeaponType>& Known, EVBWeaponType Weapon);
+}
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class VOWBOUND_API UVBWeaponStateComponent : public UActorComponent
@@ -24,12 +47,23 @@ public:
 	FORCEINLINE EVBWeaponType GetDefaultWeaponType() const { return DefaultWeaponType; }
 	// Tab 재발도용 무기 결정 (FIND-030, user 확정 06-10): 선택 무기(상태2 잔존) → 마지막 사용 무기 → 디폴트.
 	// 자동납도가 평상 복귀하며 CurrentWeaponType 을 비워도, 직전에 쓰던 무기를 다시 꺼내는 게 직관과 일치.
-	FORCEINLINE EVBWeaponType GetResummonWeaponType() const
-	{
-		if (CurrentWeaponType  != EVBWeaponType::None) return CurrentWeaponType;
-		if (LastUsedWeaponType != EVBWeaponType::None) return LastUsedWeaponType;
-		return DefaultWeaponType;
-	}
+	// 가진 무기만 고른다(.sw/prologue-opening 3.1): 디폴트를 안 가졌으면 가진 것 중 첫째, 하나도 없으면 None.
+	EVBWeaponType GetResummonWeaponType() const;
+
+	// 가진 무기(.sw/prologue-opening 3.1). 꺼내는 길 셋(Tab·슬롯 키·공격 자동 발도)과 이어하기 복원이 모두
+	//   ServerSummonWeapon 한 곳을 지나므로 그 자리에서 이것을 묻는다. 무기 바퀴(퀵슬롯 C)도 이 목록을 읽는다.
+	// 시작값: 맵에 AVBStartingLoadout 이 있으면 그 목록, 없으면 WeaponDataMap 의 전부(기존 맵의 동작 그대로).
+	bool IsWeaponOwned(EVBWeaponType InWeaponType) const;
+	const TArray<EVBWeaponType>& GetOwnedWeapons() const { return OwnedWeapons; }
+
+	// 서버에서만. 모르는 무기(WeaponDataMap 에 없음)·None·클라 호출은 Failed.
+	EVBWeaponGrantResult GrantWeapon(EVBWeaponType InWeaponType);
+
+	// 저장 복원용(서버). 목록을 통째로 바꾼다 - 모르는 무기는 버리고 경고한다.
+	void SetOwnedWeapons(const TArray<EVBWeaponType>& InWeapons);
+
+	// 서버에서는 바꾼 직후, 소유 클라에서는 복제가 왔을 때.
+	FVBOnOwnedWeaponsChanged OnOwnedWeaponsChanged;
 	// 술어 정본 (DEC-006): 무기On = ArmedCombat 뿐 / 전투 = Unarmed 가 아닌 모든 상태 (상태2·3).
 	FORCEINLINE bool IsWeaponSummoned() const { return LocomotionState == EVBLocomotionState::ArmedCombat; }
 	FORCEINLINE bool IsInCombat() const { return LocomotionState != EVBLocomotionState::Unarmed; }
@@ -40,6 +74,11 @@ public:
 	// 상태 enum 으로 받는 이유: 소비처(VBAnimInstance)가 crouch 리다이렉트 전의 WSC 진실을 들고 있어
 	//   컴포넌트가 LocomotionState 를 다시 읽으면 오염된 값과 갈릴 수 있다.
 	EVBWeaponType GetMMPoolForState(EVBLocomotionState InState) const;
+
+	// 현재 무기로 걸 수 있는 처형 목록. 무기 미등록이면 nullptr, 등록됐는데 비어 있으면 빈 배열이다.
+	// 둘을 가르는 이유: 「그 무기를 모른다」와 「알지만 처형 자산이 아직 없다」는 다른 상태이고,
+	//   후자는 정상이라 경고를 다르게 내야 한다.
+	const TArray<TObjectPtr<UVBFinisherConfig>>* GetFinisherConfigs() const;
 
 	// 로코모션이 따라야 할 상태. 파쿠르 임시수납 중에는 무기가 없는 것으로 본다 - 그 구간의 연기와
 	//   속도는 평상이어야 한다. 이 판정이 두 곳에 있으면 애니와 속도가 서로 다른 상태를 믿게 된다.
@@ -58,12 +97,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Weapon")
 	void SummonWeapon(EVBWeaponType InWeaponType);
 
-	// 납도 — 무기만 집어넣고 전투는 유지 (ArmedCombat → ArmedExploration, DEC-006 ②).
+	// 납도 — 무기만 집어넣고 전투는 유지 (ArmedCombat → CombatSheathed, DEC-006 ②).
 	// 전투 이탈은 TryCombatExit 타이머가 담당 (상태2·3 어디서든 → Unarmed 직행).
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Weapon")
 	void SheatheWeapon();
 
-	// 전투 자극 (락온/피격 등) — 발도 없이 전투 진입(Unarmed→ArmedExploration), 이미 전투면 타이머 리셋.
+	// 전투 자극 (락온/피격 등) — 발도 없이 전투 진입(Unarmed→CombatSheathed), 이미 전투면 타이머 리셋.
 	// 공격의 자동 발도는 여기가 아니라 공격 GA 의 EnsureWeaponSummoned 경로가 담당 (DEC-006 ①③ 분리).
 	UFUNCTION(BlueprintCallable, Category="Vowbound|Weapon")
 	void EnterCombat();
@@ -100,6 +139,9 @@ public:
 	
 	
 protected:
+	// 가진 무기의 시작값을 여기서 정한다 - BeginPlay 가 아닌 이유: 이어하기는 폰을 낳은 직후, 월드 BeginPlay 전에
+	//   저장을 적용한다(AVBGameMode::HandleStartingNewPlayer). BeginPlay 에서 정하면 복원된 목록을 시작값이 덮는다.
+	virtual void InitializeComponent() override;
 	virtual void BeginPlay() override;
 	virtual void GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const override;
 	
@@ -150,9 +192,14 @@ protected:
 	
 	UPROPERTY(ReplicatedUsing=OnRep_LocomotionState)
 	EVBWeaponType CurrentWeaponType = EVBWeaponType::None;
+
+	// 가진 무기. 소유 클라에만 복제한다(무기 바퀴가 읽는다). 쓰기는 서버만.
+	UPROPERTY(ReplicatedUsing=OnRep_OwnedWeapons)
+	TArray<EVBWeaponType> OwnedWeapons;
 	
 	// NOTE: 아래 3개는 GC/리플리케이션 내부 상태. exposure 키워드 없이 UPROPERTY() 유지.
-	UPROPERTY()
+	// 외형도 원격 클라이언트에서 파쿠르 중 숨겨야 한다.
+	UPROPERTY(ReplicatedUsing=OnRep_LocomotionState)
 	bool bIsTempSheathed = false;
 
 	// 파쿠르 전 상태 기억 파쿠르 후 복원하기 위함
@@ -176,6 +223,9 @@ private:
 	// 로코모션 상태 변경 시 클라이언트에서 델리게이트 브로드 캐스트
 	UFUNCTION()
 	void OnRep_LocomotionState();
+
+	UFUNCTION()
+	void OnRep_OwnedWeapons();
 	
 	// 상태 전환읜 단일 진입점이다.
 	void SetLocomotionState(EVBLocomotionState NewState);

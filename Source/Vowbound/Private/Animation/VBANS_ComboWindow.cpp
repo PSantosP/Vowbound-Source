@@ -5,6 +5,7 @@
 
 #include "AbilitySystemBlueprintLibrary.h"
 #include "AbilitySystem/VBGameplayTags.h"
+#include "Animation/AnimNotifyLibrary.h"
 #include "Vowbound/Vowbound.h"
 
 UVBANS_ComboWindow::UVBANS_ComboWindow()
@@ -37,6 +38,7 @@ void UVBANS_ComboWindow::NotifyBegin(USkeletalMeshComponent* MeshComp, UAnimSequ
 	
 	FGameplayEventData EventData;
 	EventData.EventTag = VBGameplayTags::Event_Combo_WindowOpen;
+	EventData.OptionalObject = this;
 	UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(
 		OwnerActor,
 		VBGameplayTags::Event_Combo_WindowOpen,
@@ -71,6 +73,8 @@ void UVBANS_ComboWindow::NotifyEnd(USkeletalMeshComponent* MeshComp, UAnimSequen
 	
 	FGameplayEventData EventData;
 	EventData.EventTag = VBGameplayTags::Event_Combo_WindowClose;
+	EventData.OptionalObject = this;
+	EventData.EventMagnitude = UAnimNotifyLibrary::NotifyStateReachedEnd(EventReference) ? 1.0f : 0.0f;
 	UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(
 		OwnerActor,
 		VBGameplayTags::Event_Combo_WindowClose,

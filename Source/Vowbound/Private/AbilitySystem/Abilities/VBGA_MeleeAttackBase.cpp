@@ -5,20 +5,26 @@
 
 #include "AbilitySystemBlueprintLibrary.h"
 #include "AbilitySystemComponent.h"
+#include "AbilitySystemGlobals.h"
 #include "MotionWarpingComponent.h"
-#include "RootMotionModifier.h" // EWarpTargetLocationOffsetDirection
+#include "RootMotionModifier.h" // EWarpTargetLocationOffsetDirection, URootMotionModifier_Warp::WarpTargetName
+#include "AnimNotifyState_MotionWarping.h" // MeasureMontageLungeCm - 접근 워프 창의 끝 시각
 #include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
 #include "Abilities/Tasks/AbilityTask_WaitGameplayEvent.h"
 #include "AbilitySystem/VBGameplayTags.h"
 #include "AbilitySystem/Attributes/VBCombatAttributeSet.h"
+#include "AbilitySystem/Attributes/VBHealthAttributeSet.h"
 #include "Character/VBCharacter.h"
+#include "Character/VBMeleeTraceComponent.h"
 #include "Character/VBTargetable.h"
 #include "Character/VBTargetLockComponent.h"
 #include "Character/VBWeaponStateComponent.h"
 #include "Data/VBWeaponMovesetConfig.h"
+#include "Enemy/VBEnemyBase.h" // ResolveStrideScale - 공격 자산의 거리는 애니 고유 단위라 공격자 몸 배율을 곱한다
 #include "Data/VBSwingImpactProfile.h" // Cast<> 대상 + LocalSwingAxis 읽기 — 완전 타입 필요
 #include "AbilitySystem/Abilities/VBWeaponStyleBehavior.h"
 #include "GameFramework/Character.h"
+#include "Animation/AnimMontage.h" // ExtractRootMotionFromTrackRange
 #include "Components/CapsuleComponent.h"
 #include "Animation/VBMotionWarpingNames.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -60,22 +66,55 @@ UVBGA_MeleeAttackBase::UVBGA_MeleeAttackBase()
 	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerInitiated;
 }
 
+bool UVBGA_MeleeAttackBase::CanActivateAbility(const FGameplayAbilitySpecHandle Handle,
+                                               const FGameplayAbilityActorInfo* ActorInfo,
+                                               const FGameplayTagContainer* SourceTags,
+                                               const FGameplayTagContainer* TargetTags,
+                                               FGameplayTagContainer* OptionalRelevantTags) const
+{
+	if (!Super::CanActivateAbility(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags))
+	{
+		return false;
+	}
+	const AVBCharacter* VBChar = ActorInfo ? Cast<AVBCharacter>(ActorInfo->AvatarActor.Get()) : nullptr;
+	const UVBWeaponStateComponent* WSC = VBChar ? VBChar->GetWeaponStateComponent() : nullptr;
+	if (WSC && WSC->GetResummonWeaponType() == EVBWeaponType::None)
+	{
+		// 막힌 이유를 남긴다 - 안 그러면 «공격 키가 안 먹는다» 가 유일한 증상이다. 소유 목록은 소유 클라에도 복제되므로 클라에서도 같은 판정이다.
+		VB_LOG(Log, "%s: 가진 무기가 없어 공격하지 않는다", *GetNameSafe(VBChar));
+		return false;
+	}
+	return true;
+}
+
 void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     Handle,
                                            const FGameplayAbilityActorInfo*     ActorInfo,
                                            const FGameplayAbilityActivationInfo ActivationInfo,
                                            const FGameplayEventData*            TriggerEventData)
 {
 	Super::ExecuteAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	++ActivationSerial;   // 맞은 뒤 처리가 «같은 스윙» 인지 가르는 번호(ApplySwingHits)
 
 	// ServerInitiated 전환으로 이 함수는 서버/클라 양쪽에서 실행된다.
 	// 몽타주 재생 Task는 양쪽 공통(로컬 재생), Trace/GE/Event 송신은 서버 전용 가드 필요.
 	const bool bIsServer = ActorInfo && ActorInfo->IsNetAuthority();
+
+	// 콤보 «첫 타» 의 처형 관문. 다음 타 쪽은 TryChainToNextSection 이 맡는다.
+	if (TryOpenFinisher(ActorInfo))
+	{
+		// 처형이 열렸다. 이 공격은 몽타주를 틀지 않고 조용히 끝낸다.
+		// 취소가 아니라 정상 종료다 - 입력은 의도대로 처리됐고 다른 어빌리티가 그 일을 맡았다.
+		EndAbility(Handle, ActorInfo, ActivationInfo, /*bReplicateEndAbility=*/true,
+		           /*bWasCancelled=*/false);
+		return;
+	}
 
 	ComboIndex       = 0;
 	// 변형 재생배율은 활성화마다 초기화한다(VariantCursor 와 반대).
 	// 이 값은 "이번에 고른 변형의 배율"이라 다음 활성화로 새어 나가면 안 된다.
 	ActiveVariantRate = 1.0f;
 	ActiveVariantDamage = 1.0f;
+	ActiveVariantApproachOffset = -1.0f;
 	bComboWindowOpen = false;
 	bSaveAttack      = false;
 
@@ -98,53 +137,56 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 		{
 			if (UVBWeaponStateComponent* WSC = VBChar->GetWeaponStateComponent())
 			{
+				// 기본 무기를 안 가졌으면 가진 것 중에서 고른다(GetResummonWeaponType). 하나도 없으면 CanActivateAbility 가 이미 막았다.
 				const EVBWeaponType SummonType = (WSC->GetCurrentWeaponType() != EVBWeaponType::None)
-					? WSC->GetCurrentWeaponType() : WSC->GetDefaultWeaponType();
+					? WSC->GetCurrentWeaponType()
+					: (WSC->IsWeaponOwned(WSC->GetDefaultWeaponType()) ? WSC->GetDefaultWeaponType() : WSC->GetResummonWeaponType());
 				WSC->EnsureWeaponSummoned(SummonType);
 			}
 		}
 		VBChar->NotifyCombatStimulus();
+	}
 
-		if (MovesetConfig)
+	// 무브셋·공격 자산 해석은 아바타 종류와 무관하다 - 적(AVBCharacter 아님)도 여기서 leaf 를 잡는다.
+	//   종전에는 위 캐릭터 가드 안에 있어 적 GA 는 이 블록을 아예 안 거쳤다(2026-09-06 PIE 세 판 연속 «미설정» 의 실제 원인).
+	{
+		// 현재 무기 타입의 leaf. 무브셋이 없거나 미등록이면 GA 에 직접 할당된 AttackConfig 가 그 자리다 -
+		//   PeekAttackConfig 와 같은 규칙(예고 단계가 읽는 자산과 스윙이 재생하는 자산이 갈리면 안 된다).
+		// 종전(2026-09-06 이전)은 무브셋이 있을 때만 여기 들어와 적 GA 는 AttackConfig->AttackMontage 를 영영 안 읽었다.
+		//   그래서 몽타주의 홈이 «적 = GA 의 AnimMontage / 플레이어 = 공격 자산» 둘로 갈렸고, 공격 자산에만 몽타주를
+		//   적은 병사 GA 가 «AttackMontage 미설정» 폴백으로 떨어져 애니 없이 즉시 데미지를 넣었다(PIE 실측).
+		//   지금은 공격 자산이 먼저고, 거기 몽타주가 없을 때만 GA 의 AnimMontage 가 남는다(감염체 BP 가 그 경로).
+		UVBAttackConfig* Leaf = ResolveMovesetLeaf();
+		if (!Leaf)
 		{
-			EVBWeaponType WeaponType = EVBWeaponType::None;
-			if (const UVBWeaponStateComponent* WSC = VBChar->GetWeaponStateComponent())
-			{
-				WeaponType = WSC->GetCurrentWeaponType();
-			}
-			// 현재 무기 타입의 leaf. 미등록이면 nullptr → 레거시 폴백 유지.
-			UVBAttackConfig* Leaf = MovesetConfig->GetAttackConfig(WeaponType);
-			int32 VariantCount = 0;
-			if (Leaf)
-			{
-				ActiveConfig = Leaf;
-
-				// 변형 해석. 변형이 없으면 결과가 AttackMontage 그대로라 현행과 동일 동작이다.
-				VariantCount = Leaf->GetMontageVariantCount();
-				const FVBAttackMontageVariant Variant = Leaf->ResolveMontageVariant(VariantCursor);
-				if (Variant.Montage)
-				{
-					ActiveMontage    = Variant.Montage;
-					ActiveVariantRate   = Variant.PlayRateScale;
-					ActiveVariantDamage = Variant.DamageScale;
-				}
-
-				// 변형이 2개 이상일 때만 커서를 민다.
-				// 왜: 커서는 GA 하나에 하나인데 ActiveConfig 는 무기에 따라 바뀐다.
-				//   변형이 1개인 무기(대검)가 커서를 밀면 카타나 반격이 A -> A 로 반복된다.
-				if (VariantCount > 1)
-				{
-					++VariantCursor;
-				}
-			}
-			// 무브셋 해석 1줄 계측 — 무기 타입/leaf/최종 몽타주/변형 (오선택 진단용)
-			VB_LOG(Log, "%s: Moveset resolve — WeaponType=%d Leaf=%s Montage=%s variant=%d/%d rate=%.2f",
-				*GetName(), (int32)WeaponType,
-				Leaf ? *Leaf->GetName() : TEXT("null(legacy-fallback)"),
-				ActiveMontage ? *ActiveMontage->GetName() : TEXT("null"),
-				VariantCount > 0 ? ((VariantCursor - 1 + VariantCount) % VariantCount) : 0,
-				VariantCount, ActiveVariantRate);
+			Leaf = AttackConfig;
 		}
+		int32 VariantCount = 0;
+		int32 ChosenVariantIndex = 0;
+		if (Leaf)
+		{
+			ActiveConfig = Leaf;
+
+			// 변형 해석. 변형이 없으면 결과가 AttackMontage 그대로라 현행과 동일 동작이다.
+			VariantCount = Leaf->GetMontageVariantCount();
+			ChosenVariantIndex = SelectVariantIndex(*Leaf, VariantCount);
+			const FVBAttackMontageVariant Variant = Leaf->ResolveMontageVariant(ChosenVariantIndex);
+			if (Variant.Montage)
+			{
+				ActiveMontage    = Variant.Montage;
+				ActiveVariantRate   = Variant.PlayRateScale;
+				ActiveVariantDamage = Variant.DamageScale;
+				ActiveVariantApproachOffset = Leaf->GetVariantApproachOffset(ChosenVariantIndex, AVBEnemyBase::ResolveStrideScale(GetAvatarActorFromActorInfo()));
+			}
+
+		}
+		// 무브셋 해석 1줄 계측 — 무기 타입/leaf/최종 몽타주/변형 (오선택 진단용)
+		VB_LOG(Log, "%s: Moveset resolve — WeaponType=%d Leaf=%s Montage=%s variant=%d/%d rate=%.2f",
+			*GetName(), (int32)GetCurrentWeaponType(),
+			Leaf ? *Leaf->GetName() : TEXT("null(legacy-fallback)"),
+			ActiveMontage ? *ActiveMontage->GetName() : TEXT("null"),
+			VariantCount > 0 ? ((ChosenVariantIndex % VariantCount) + VariantCount) % VariantCount : 0,
+			VariantCount, ActiveVariantRate);
 	}
 
 	// 2. 몽타주가 없으면 즉시 Trace 후 종료(폴백)
@@ -159,7 +201,7 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 		return;
 	}
 
-	// 거대검 뚝심(SuperArmor): leaf 설정이 슈퍼아머를 요구하면 스윙 동안 피격 히트리액트를 억제할 태그 부여.
+	// 거대검 슈퍼아머(SuperArmor): leaf 설정이 슈퍼아머를 요구하면 스윙 동안 피격 히트리액트를 억제할 태그 부여.
 	// 억제 방식 = 피격자의 UVBGA_HitReact 가 이 태그를 ActivationBlockedTags 로 걸어 활성화 자체가 안 된다.
 	//   (연출을 스킵하는 게 아니라 능력이 안 켜지는 것 — GAS 네이티브 게이트라 커스텀 판정 코드가 0이다.)
 	// 로스태그가 복제되지 않아도 무방한 이유: 트리거 활성화는 서버 권위에서만 시도되므로 판정이 읽는 ASC 는 항상 서버 ASC 이고,
@@ -169,16 +211,34 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 	// 제거는 EndAbility(완료/중단/취소 3경로가 수렴 — BlendOut 은 EndAbility 를 호출하지 않으나 뒤이어 Completed 가 온다)에서 단일화. bGrantedSuperArmor로 부여한 경우만 제거.
 	if (ActiveConfig && ActiveConfig->bSuperArmorDuringAttack)
 	{
-		if (UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo())
-		{
-			// 복제 상태를 명시한다. 생략하면 EGameplayTagReplicationState::None 이 되는데,
-			//   그것은 이 프로젝트에서 이 한 곳만 쓰던 값이었다(나머지 로스태그 6곳은 전부 CountToOwner).
-			//   판정 자체는 서버에서만 도므로 동작은 안 바뀌고, 같은 종류의 태그가 같은 규약을 갖게 된다.
-			OwnerASC->AddLooseGameplayTag(VBGameplayTags::State_Combat_SuperArmor, 1,
-			                              EGameplayTagReplicationState::CountToOwner);
-			bGrantedSuperArmor = true;
-		}
+		GrantSuperArmorOnce();
 	}
+
+	// 회피 오프셋 (design §3.4): 회피가 끊은 콤보를 유예 안에 같은 무기로 이어 받는다. 시작 섹션으로 표현하므로 몽타주는 그대로다.
+	// 워프 등록보다 먼저 - 워프 로그의 «몇 타» 가 재개한 타를 가리키게(2026-09-06 로그에서 1타로 찍히던 것 정정).
+	FName StartSection = NAME_None;
+	{
+		const double Now   = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+		const float  Grace = ActiveConfig ? ActiveConfig->DodgeOffsetGraceSeconds : 0.0f;
+		// DodgeOffsetComboIndex 는 «재개할 타» 다. 끊긴 타가 아직 안 닿았으면 그 타, 닿았으면 다음 타(EndAbility 에서 정함).
+		//   종전(같은 날 첫 판)은 무조건 다음 타라 닿기 전에 끊은 타를 건너뛰었다(user 「그 콤보는 스킵되고 다음 콤보로」).
+		if (DodgeOffsetComboIndex > 0 && Grace > 0.0f && (Now - DodgeOffsetTime) <= Grace
+		    && DodgeOffsetWeapon == GetCurrentWeaponType()
+		    && ActiveConfig && DodgeOffsetComboIndex < ActiveConfig->MaxComboCount
+		    && ActiveConfig->ComboSectionNames.IsValidIndex(DodgeOffsetComboIndex))
+		{
+			ComboIndex   = DodgeOffsetComboIndex;
+			StartSection = ActiveConfig->ComboSectionNames[ComboIndex];
+			VB_LOG(Log, "[Combo] 회피 오프셋 - %.2f초 전 끊김 -> %d타(%s)부터 재개",
+			       Now - DodgeOffsetTime, ComboIndex + 1, *StartSection.ToString());
+		}
+		DodgeOffsetComboIndex = -1;   // 한 번 쓰거나 유예를 넘기면 버린다
+	}
+	ComboInputTime     = -1.0;
+	bChainedThisWindow = false;
+	ActiveComboWindowNotify.Reset();
+	bHitFrameReached   = false;
+	HitFrameTime       = -1.0;
 
 	// 워프 윈도우 진입 시 타겟이 이미 등록이 되어있어야 한다. (양쪽 공통 — 로컬 재생 정렬)
 	SetWarpTargetLockedEnemy();
@@ -193,7 +253,7 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 			                                                               NAME_None,
 			                                                               ActiveMontage,
 			                                                               MontagePlayRate * ConfigRateScale * ActiveVariantRate,
-			                                                               NAME_None,
+			                                                               StartSection,
 			                                                               true,
 			                                                               1.0f,
 			                                                               0.0f,
@@ -208,10 +268,25 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 	// 5. Task 활성화
 	MontageTask->ReadyForActivation();
 
+	// ReadyForActivation 이 이 어빌리티를 «그 자리에서» 끝낼 수 있다.
+	//   엔진이 몽타주를 못 틀면(UAbilityTask_PlayMontageAndWait::Activate 의 `if (!bPlayedMontage)`)
+	//   Activate 안에서 OnCancelled 를 쏘고, 위에서 건 OnMontageCancelled -> EndAbility 가 동기로 돈다.
+	//   그때 아래 이벤트 대기 Task 들을 그대로 만들면 EndAbility 가 ActiveTasks 를 비운 «뒤» 에
+	//   ASC 콜백에 등록되어 고아가 된다. 이 GA 는 InstancedPerActor 라 그 고아가 다음 활성화까지 살아
+	//   같은 노티파이 하나에 핸들러가 두 번 돌고, 한 번의 휘두름이 피해를 두 번 넣는다
+	//   (ProcessedActors 는 호출마다 새로 만드는 지역 변수라 이중 적용을 못 막는다).
+	// 못 트는 경우가 실제로 있다: VBAbilitySystemComponent::PlayMontage 는 ExternalMontageOwner 가
+	//   잡혀 있으면 0 을 돌려주고, 처형은 두 참가자 모두에게 그것을 건다.
+	// 같은 가드가 VBGA_GetUp · VBGA_EnemyMeleeAttack · VBGA_FinisherWindow 에 이미 있다 - 여기만 빠져 있었다.
+	if (!IsActive())
+	{
+		return;
+	}
 
-	// 6. AnimNotify에서 보내는 GameplayEvent 대기 — 서버 전용
-	// (클라도 수신하면 PerformAttackTrace 이중 호출됨. OnAttackTraceEvent 내부 가드만으론 Task 자체가 낭비)
-	if (bIsServer)
+
+	// 6. AnimNotify에서 보내는 GameplayEvent 대기 — 양쪽 공통 (2026-09-05 개정)
+	// 종전엔 서버 전용이었다(클라 이중 트레이스 방지). 지금은 클라도 «닿는 프레임» 을 알아야 조기 전환을 같은 시점에 하므로
+	//   양쪽이 듣고, 트레이스·스타일 훅은 핸들러 안에서 권위 가드로 서버만 돈다.
 	{
 		UAbilityTask_WaitGameplayEvent* EventTaskAttackTrace =
 				UAbilityTask_WaitGameplayEvent::WaitGameplayEvent(
@@ -223,6 +298,20 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 
 		EventTaskAttackTrace->EventReceived.AddDynamic(this, &ThisClass::OnAttackTraceEvent);
 		EventTaskAttackTrace->ReadyForActivation();
+	}
+
+	// 판정 창 닫힘 - 서버만 듣는다. 창은 서버에서만 열린다(UVBMeleeTraceComponent::BeginWindow 의 권위 관문).
+	if (bIsServer)
+	{
+		UAbilityTask_WaitGameplayEvent* EventTaskAttackTraceEnd =
+				UAbilityTask_WaitGameplayEvent::WaitGameplayEvent(
+				                                                  this,
+				                                                  VBGameplayTags::Event_Montage_AttackTraceEnd,
+				                                                  nullptr,
+				                                                  false,	// 섹션마다 창이 하나씩 닫힌다
+				                                                  true);
+		EventTaskAttackTraceEnd->EventReceived.AddDynamic(this, &ThisClass::OnAttackTraceEndEvent);
+		EventTaskAttackTraceEnd->ReadyForActivation();
 	}
 
 	if (ActiveConfig && ActiveConfig->MaxComboCount > 1)
@@ -269,7 +358,26 @@ void UVBGA_MeleeAttackBase::ExecuteAbility(const FGameplayAbilitySpecHandle     
 // AnimNotify에서 이벤트 수신 -> Trace 실행
 void UVBGA_MeleeAttackBase::OnAttackTraceEvent(FGameplayEventData PayLoad)
 {
+	// 닿는 프레임 도달 - 양쪽 공통. 조기 전환의 두 번째 조건이다(design §3.2 정정).
+	bHitFrameReached = true;
+	HitFrameTime     = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+
+	// 트레이스·스타일 훅은 서버만. 클라는 표시만 하고 전환 시도로 간다.
+	if (!CurrentActorInfo || !CurrentActorInfo->IsNetAuthority())
+	{
+		TryChainAfterHit();
+		return;
+	}
 	VB_LOG(Log, "%s: AttackTrace 이벤트 수신 -> Trace 실행", *GetName());
+	// 계측: 닿는 프레임에 목표까지 남은 거리. [Warp] 시작 거리와의 차가 «워프가 실제로 붙여 준 거리» 다.
+	if (const USceneComponent* AimTarget = ResolveAimTargetComponent())
+	{
+		if (const AActor* Avatar = GetAvatarActorFromActorInfo())
+		{
+			VB_LOG(Log, "[Warp] %d타 닿는 프레임 - 목표 %s 까지 %.0fcm", ComboIndex + 1, *GetNameSafe(AimTarget->GetOwner()),
+			       FVector::Dist2D(Avatar->GetActorLocation(), AimTarget->GetComponentLocation()));
+		}
+	}
 
 	// 이번 스윙의 임팩트 쉐이크 프로필을 캐시한다. 노티마다 덮어쓴다.
 	// 왜 활성화 단위가 아니라 노티 단위인가: 한 몽타주 안의 2타가 1타 프로필을 물려받으면
@@ -280,17 +388,66 @@ void UVBGA_MeleeAttackBase::OnAttackTraceEvent(FGameplayEventData PayLoad)
 	//  여기서 null 을 걸러 이전 값을 유지하면 저작 안 한 스윙이 직전 스윙의 무게를 물려받는다.
 	ActiveSwingCombatProfile = Cast<UVBSwingCombatProfile>(PayLoad.OptionalObject2.Get());
 
-	// 스타일 고유 타격(예: 마법 투사체)이 있으면 위임. 처리되면(true) 기본 SphereTrace 스킵.
+	// 스타일 고유 타격(예: 마법 투사체)이 있으면 위임. 처리되면(true) 기본 판정 스킵. 판정 창이면 창 시작에서 한 번 묻는다.
 	if (ActiveConfig && ActiveConfig->StyleBehavior && ActiveConfig->StyleBehavior->DeliverHit(this))
 	{
+		TryChainAfterHit();
 		return;
 	}
-	PerformAttackTrace();
+	// 판정 창(UVBANS_AttackTraceWindow)은 Melee.Window 표지를 싣는다. 없으면 옛 한 프레임 노티다 - 창으로 안 바꾼 몽타주는 옛 방식 그대로 돈다.
+	if (PayLoad.InstigatorTags.HasTagExact(VBGameplayTags::Melee_Window))
+	{
+		BeginTraceWindow(PayLoad);
+	}
+	else
+	{
+		PerformAttackTrace();
+	}
+	TryChainAfterHit();
+}
+
+void UVBGA_MeleeAttackBase::OnAttackTraceEndEvent(FGameplayEventData PayLoad)
+{
+	FGameplayTag Shape;
+	for (const FGameplayTag& Tag : PayLoad.InstigatorTags)
+	{
+		if (Tag.MatchesTag(VBGameplayTags::Melee_Shape) && Tag != VBGameplayTags::Melee_Shape)
+		{
+			Shape = Tag;
+			break;
+		}
+	}
+	// 모양 없는 창은 BeginTraceWindow 가 열지 않았다(경고 후 옛 판정). 닫을 것이 없다 - 여기서 전부 닫으면 겹쳐 열린 다른 창을 끊는다.
+	//   남는 창은 섹션 전환·EndAbility 가 닫는다.
+	if (Shape.IsValid())
+	{
+		EndTraceWindowByShape(Shape, PayLoad.EventMagnitude > 0.0f);
+	}
+}
+
+void UVBGA_MeleeAttackBase::TryChainAfterHit()
+{
+	// 네 조건: 저장 입력 / 조기 전환 스위치 / 창 열림 / 닿음. 여운이 남았으면 타이머로 돌아온다.
+	if (!bSaveAttack || !ActiveConfig || !ActiveConfig->bChainAtWindowOpen) return;
+	if (!bComboWindowOpen || !bHitFrameReached) return;
+	const double Now       = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	const double Remaining = (HitFrameTime + ActiveConfig->ChainDelayAfterHitSeconds) - Now;
+	if (Remaining > 0.0)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().SetTimer(ChainDelayTimer, this, &UVBGA_MeleeAttackBase::TryChainAfterHit, static_cast<float>(Remaining), false);
+		}
+		return;
+	}
+	TryChainToNextSection();
 }
 
 // 몽타주 정상 완료 -> GA 종료
 void UVBGA_MeleeAttackBase::OnMontageCompleted()
 {
+	if (AVBCharacter* Character = Cast<AVBCharacter>(GetAvatarCharacter()))
+		Character->StopResidualAttackMotion(0.0f, ActiveMontage);
 	LogMontageMeshState(TEXT("Completed"), GetAvatarCharacter());
 	VB_LOG(Log, "%s: 몽타주 완료 -> EndAbility", *GetName());
 	ClearWarpTarget();
@@ -300,6 +457,13 @@ void UVBGA_MeleeAttackBase::OnMontageCompleted()
 // 몽타주 BlendOut 시작
 void UVBGA_MeleeAttackBase::OnMontageBlendOut()
 {
+	// 저작된 복귀는 자연 블렌드아웃까지 유지한다. 무입력 잔여 이동만 이 몽타주의 수명에 묶어 정리한다.
+	if (AVBCharacter* Character = Cast<AVBCharacter>(GetAvatarCharacter()))
+	{
+		const float Frame = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.0f;
+		Character->StopResidualAttackMotion(2.0f * Frame, ActiveMontage);
+		Character->BeginRecoveryCancelTrace();
+	}
 	// BlendOut 중에는 아직 GA가 살아있다.
 	// 필요 시 여기서 "취소 가능" 상태 전환 (콤보 윈도우 등)
 	LogMontageMeshState(TEXT("BlendOut"), GetAvatarCharacter());
@@ -326,7 +490,7 @@ void UVBGA_MeleeAttackBase::OnMontageCancelled()
 	EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, true);
 }
 
-// 공격 종료 — 뚝심 로스태그 제거(부여했던 경우만).
+// 공격 종료 — 슈퍼아머 로스태그 제거(부여했던 경우만).
 // 수렴 경로: OnMontageCompleted / OnMontageInterrupted / OnMontageCancelled 3곳이 EndAbility 를 호출한다.
 // (OnMontageBlendOut 은 EndAbility 를 호출하지 않는다 — 해당 줄은 주석 처리됨. BlendOut 뒤에 Completed 가
 //  이어지므로 태그 누수는 없다. 과거 주석이 "4경로"라 적었으나 사실이 아니었다 — 2026-07-16 /verify 지적으로 정정.)
@@ -346,40 +510,84 @@ void UVBGA_MeleeAttackBase::EndAbility(const FGameplayAbilitySpecHandle     Hand
 		bGrantedSuperArmor = false;
 	}
 
+	if (UWorld* World = GetWorld()) { World->GetTimerManager().ClearTimer(ChainDelayTimer); }
+
+	// 열린 판정 창을 닫는다. 몽타주가 끊기면 노티의 끝 알림도 오지만, 그보다 먼저 이 GA 가 끝나면 끝 이벤트 대기 태스크가 이미 없다.
+	//   GA 는 InstancedPerActor 라 닫지 않으면 다음 활성화에 옛 창의 콜백이 들어온다.
+	EndAllTraceWindows();
+
+	// 회피 오프셋 기억 (design §3.4): 회피가 끊었을 때만. 피격·가드·완료·회복 캔슬은 기억하지 않는다.
+	if (bWasCancelled && ActiveConfig && ActiveConfig->DodgeOffsetGraceSeconds > 0.0f)
+	{
+		const UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo();
+		if (OwnerASC && OwnerASC->HasMatchingGameplayTag(VBGameplayTags::State_Combat_Dodging))
+		{
+			// 재개할 타: 끊긴 타가 아직 안 닿았으면 그 타를 다시, 닿았으면 다음 타. 닿음은 bHitFrameReached 가 이 섹션 기준으로 들고 있다.
+			DodgeOffsetComboIndex = bHitFrameReached ? ComboIndex + 1 : ComboIndex;
+			DodgeOffsetTime       = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+			DodgeOffsetWeapon     = GetCurrentWeaponType();
+			VB_LOG(Log, "[Combo] 회피가 %d타를 끊음(닿음 %s) - %.1f초 안에 %d타부터 재개",
+			       ComboIndex + 1, bHitFrameReached ? TEXT("O") : TEXT("X"), ActiveConfig->DodgeOffsetGraceSeconds, DodgeOffsetComboIndex + 1);
+		}
+	}
+
+	ClearWarpTarget();
 	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }
 
-// 이 공격이 겨누는 대상. 하드락 우선, 없으면 넷-세이프 소프트 런지 스캔 폴백.
-// 카메라를 쓰지 않으므로 서버·클라 결정론이 유지된다.
+// 스윙 진입에서 확정한 대상만 읽는다. 도중 락 전환은 다음 스윙에 반영한다.
 const USceneComponent* UVBGA_MeleeAttackBase::ResolveAimTargetComponent() const
 {
-	const AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarActorFromActorInfo());
-	if (!VBChar) { return nullptr; }   // 적 아바타는 AVBCharacter 아님 - 구조적 제외
+	AActor* Target = SwingTarget.Get();
+	if (!IsValid(Target)) return nullptr;
+	const IVBTargetable* Targetable = Cast<IVBTargetable>(Target);
+	return Targetable && Targetable->IsTargetable() ? Target->GetRootComponent() : nullptr;
+}
 
-	const UVBTargetLockComponent* TLC = VBChar->GetTargetLockComponent();
-	if (!TLC) { return nullptr; }
+void UVBGA_MeleeAttackBase::ResetSwingTarget()
+{
+	if (UAbilitySystemComponent* ASC = SwingTargetASC.Get(); ASC && SwingTargetDeathHandle.IsValid())
+		ASC->RegisterGameplayTagEvent(VBGameplayTags::State_Dead, EGameplayTagEventType::NewOrRemoved).Remove(SwingTargetDeathHandle);
+	if (AActor* Target = SwingTarget.Get())
+		Target->OnDestroyed.RemoveDynamic(this, &ThisClass::OnSwingTargetDestroyed);
+	SwingTargetDeathHandle.Reset();
+	SwingTargetASC.Reset();
+	SwingTarget.Reset();
+}
 
-	if (AActor* LockedTarget = TLC->GetLockedTarget(); IsValid(LockedTarget))
+void UVBGA_MeleeAttackBase::CaptureSwingTarget()
+{
+	ResetSwingTarget();
+	const AVBCharacter* Character = Cast<AVBCharacter>(GetAvatarActorFromActorInfo());
+	const UVBTargetLockComponent* Lock = Character ? Character->GetTargetLockComponent() : nullptr;
+	if (!Lock) return;
+	AActor* Target = Lock->GetLockedTarget();
+	if (!IsValid(Target)) Target = Lock->FindSoftLungeTarget();
+	const IVBTargetable* Targetable = Cast<IVBTargetable>(Target);
+	if (!Targetable || !Targetable->IsTargetable()) return;
+	SwingTarget = Target;
+	Target->OnDestroyed.AddDynamic(this, &ThisClass::OnSwingTargetDestroyed);
+	if (UAbilitySystemComponent* ASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Target))
 	{
-		// 죽은 락 타겟이면 겨눌 대상이 없다(현행 가드 보존).
-		if (const IVBTargetable* TargetBase = Cast<IVBTargetable>(LockedTarget))
-		{
-			if (!TargetBase->IsTargetable()) { return nullptr; }
-		}
-		return LockedTarget->GetRootComponent();
+		SwingTargetASC = ASC;
+		SwingTargetDeathHandle = ASC->RegisterGameplayTagEvent(VBGameplayTags::State_Dead, EGameplayTagEventType::NewOrRemoved)
+			.AddUObject(this, &ThisClass::OnSwingTargetDeath);
 	}
+}
 
-	// 락온 없음 -> 액터 forward 소프트 런지 스캔. 소프트 타겟은 transient 라
-	// 하드락 semantics(카메라/HUD)를 바꾸지 않는다.
-	if (AActor* SoftTarget = TLC->FindSoftLungeTarget(); IsValid(SoftTarget))
-	{
-		return SoftTarget->GetRootComponent();
-	}
-	return nullptr;
+void UVBGA_MeleeAttackBase::OnSwingTargetDeath(const FGameplayTag /*Tag*/, int32 NewCount)
+{
+	if (NewCount > 0) ClearWarpTarget();
+}
+
+void UVBGA_MeleeAttackBase::OnSwingTargetDestroyed(AActor* /*DestroyedActor*/)
+{
+	ClearWarpTarget();
 }
 
 void UVBGA_MeleeAttackBase::SetWarpTargetLockedEnemy()
 {
+	CaptureSwingTarget();
 	AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarCharacter());
 	if (!VBChar) return; // 적 아바타는 AVBCharacter 아님 → 소프트 런지/워프 대상에서 구조적 제외
 
@@ -401,33 +609,37 @@ void UVBGA_MeleeAttackBase::SetWarpTargetLockedEnemy()
 	else
 	{
 		MotionWarpingComponent->RemoveWarpTarget(VBMotionWarpingNames::AttackTarget); // 현행 no-op 동일
+		VB_LOG(Log, "[Warp] %d타 목표 없음 - 접근 워프 없음 (락온 X, 소프트 콘 밖)", ComboIndex + 1);
 	}
 }
 
-void UVBGA_MeleeAttackBase::ApplyApproachWarpToTarget(const USceneComponent* TargetComponent)
+float UVBGA_MeleeAttackBase::ComputeApproachOffset(const USceneComponent* TargetComponent) const
 {
-	// 락 경로와 소프트 런지 경로가 공유하는 워프 목적지 write(DRY).
-	// 회귀 불변식: 아래 수치 거동은 리팩터 전 SetWarpTargetLockedEnemy 락 경로와 동일해야 한다.
-	AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarCharacter());
-	if (!VBChar || !TargetComponent) return;
+	// 변형이 해석된 뒤면 그 변형의 멈춤(이미 몸 배율을 곱했다), 아니면 자산 값에 몸 배율을 곱한 것. 두 경우 다 아래 사슬은 같다.
+	const float BaseOffset = ActiveVariantApproachOffset >= 0.0f
+		                         ? ActiveVariantApproachOffset
+		                         : (ActiveConfig ? ActiveConfig->WarpApproachOffset * AVBEnemyBase::ResolveStrideScale(GetAvatarActorFromActorInfo()) : 0.0f);
+	return ComputeApproachOffset(TargetComponent, BaseOffset);
+}
 
-	UMotionWarpingComponent* MotionWarpingComponent = VBChar->GetMotionWarpingComponent();
-	if (!MotionWarpingComponent) return;
-
-	// (B) 접근 간격: 워프 목적지를 적 정중앙에서 공격자 쪽으로 WarpApproachOffset 만큼 당겨 무기 리치에서 멈춘다.
-	// 오프셋을 [0, AttackRange]로 clamp — 트레이스가 닿는 범위를 벗어나 헛치는 것을 방지.
-	// 상한이 AttackRange 인 이유: 스윕은 Start 에서 Start+Forward*AttackRange 까지 반경 AttackRadius
-	// 구체를 쓸므로, 적 중심이 정확히 AttackRange 지점에 있어도 끝점 구체가 덮는다. 적 캡슐 반경까지
-	// 더하면 여유는 더 커진다. 종전 상한 AttackRange-AttackRadius 는 필요보다 AttackRadius 만큼 더
-	// 당긴 값이었고, 그 과보수성이 리치가 가장 짧은 무기에서만 실제로 물렸다 — Fighter 는 140-50=90 이
-	// 곧 상한이라 값을 올려도 반영되지 않아 적과 거의 맞닿은 채 싸웠다(2026-08-03 user FEEL).
-	// 카타나(120<150)·대검(120<190)·반격 2종은 종전에도 상한 아래라 이 변경에 거동이 바뀌지 않는다.
-	// (ActiveConfig 는 ExecuteAbility 에서 해석됨. 두 호출자 ExecuteAbility/OnComboWindowClose 모두 이 경로 경유.)
+float UVBGA_MeleeAttackBase::ComputeApproachOffset(const USceneComponent* TargetComponent, float BaseOffset) const
+{
+	const ACharacter* VBChar = GetAvatarCharacter();
+	if (!VBChar || !TargetComponent) return 0.0f;
 	float ApproachOffset = 0.0f;
 	if (ActiveConfig)
 	{
-		ApproachOffset = FMath::Clamp(ActiveConfig->WarpApproachOffset, 0.0f,
-		                              FMath::Max(0.0f, ActiveConfig->AttackRange));
+		// BaseOffset 은 이미 몸 배율이 곱해진 값이다 - 상한인 사거리도 같은 단위로 맞춘다.
+		const float Range = ActiveConfig->GetScaledAttackRange(AVBEnemyBase::ResolveStrideScale(VBChar));
+		ApproachOffset = FMath::Clamp(BaseOffset, 0.0f, FMath::Max(0.0f, Range));
+		// 먼 시작(갭 클로저): 적이 사거리 밖에서 시작한 스윙은 더 가까이 붙는다 - 붙은 것이 눈에 보이게. FarStartApproachOffset=0 이면 없음.
+		{
+			const float StartDist = FVector::Dist2D(VBChar->GetActorLocation(), TargetComponent->GetComponentLocation());
+			if (ActiveConfig->FarStartApproachOffset > 0.0f && StartDist > Range)
+			{
+				ApproachOffset = FMath::Clamp(ActiveConfig->FarStartApproachOffset, 0.0f, ApproachOffset);
+			}
+		}
 
 		// 런타임 거리 clamp (BUG-007): 오프셋이 현재 플레이어-적 거리를 넘으면 워프 타겟이 플레이어 '뒤'에 생긴다.
 		// 그러면 SkewWarp 의 Facing 회전(bWarpRotation, bWarpTranslation 과 무관하게 항상 동작)이 적 반대 방향을
@@ -442,18 +654,7 @@ void UVBGA_MeleeAttackBase::ApplyApproachWarpToTarget(const USceneComponent* Tar
 		// 훨씬 작아 목표가 캡슐 안쪽에 생기고, CMC 가 매 프레임 밀어내며 위치가 떨린다.
 		// 그 떨림이 캡슐에 붙은 스프링암을 흔들어 "카메라가 가끔 흔들린다"로 보인다(user 2026-08-03).
 		// 반경은 런타임에서 읽는다 - 적 종류마다 다르고 스케일도 걸릴 수 있어 상수로 굳히면 어긋난다.
-		float MinSeparation = 0.0f;
-		if (const UCapsuleComponent* SelfCap = VBChar->GetCapsuleComponent())
-		{
-			MinSeparation += SelfCap->GetScaledCapsuleRadius();
-		}
-		if (const ACharacter* TargetChar = Cast<ACharacter>(TargetComponent->GetOwner()))
-		{
-			if (const UCapsuleComponent* TargetCap = TargetChar->GetCapsuleComponent())
-			{
-				MinSeparation += TargetCap->GetScaledCapsuleRadius();
-			}
-		}
+		const float MinSeparation = ComputeMinSeparation(TargetComponent);
 		// DistToEnemy 와 min 을 거는 이유: 이미 캡슐이 겹친 상태라면 하한을 그대로 적용했다가는
 		// 오프셋이 현재 거리보다 커져 워프 타겟이 플레이어 뒤로 가고 BUG-007 이 되살아난다.
 		// 그 경우엔 현재 거리를 그대로 써 전진량 0 으로 둔다 - 밀어내는 건 넉백의 몫이다.
@@ -463,6 +664,127 @@ void UVBGA_MeleeAttackBase::ApplyApproachWarpToTarget(const USceneComponent* Tar
 		}
 	}
 
+	return ApproachOffset;
+}
+
+int32 UVBGA_MeleeAttackBase::SelectVariantIndex(const UVBAttackConfig& Leaf, int32 VariantCount)
+{
+	const int32 Chosen = VariantCursor;
+	// 변형이 2개 이상일 때만 커서를 민다.
+	// 왜: 커서는 GA 하나에 하나인데 ActiveConfig 는 무기에 따라 바뀐다.
+	//   변형이 1개인 무기(대검)가 커서를 밀면 카타나 반격이 A -> A 로 반복된다.
+	if (VariantCount > 1)
+	{
+		++VariantCursor;
+	}
+	return Chosen;
+}
+
+float UVBGA_MeleeAttackBase::MeasureMontageLungeCm(const UAnimMontage* Montage, float MeshScale)
+{
+	if (!Montage) return 0.0f;
+	// 재는 구간 = 처음부터 접근 워프 창(AttackTarget 을 겨눈 MotionWarping 노티)이 닫히는 시각까지. 워프는 그 창 안의 루트모션만
+	//   목적지에 맞추고, 창 뒤의 루트모션은 생으로 돈다. 트롤 클립은 타격 뒤에도 한참 걷는다(2026-09-17 실측: 01 은 창까지 118cm,
+	//   창 뒤 276cm / 03 은 44cm 와 306cm). 클립 전체를 재면 그 뒷걸음까지 «전진» 으로 세어 시작 거리가 실제 닿는 거리보다 멀어지고,
+	//   워프는 창 안의 작은 이동(03 은 42cm)을 그 큰 값으로 늘여야 해서 순간이동처럼 보인다(user 「아직 순간이동」).
+	//   창이 없으면 클립 끝까지(제자리 클립은 어차피 0 근처). 세그먼트의 시퀀스에 EnableRootMotion 이 꺼져 있으면 0 - 그것도 «안 간다» 는 사실이다.
+	float EndTime = Montage->GetPlayLength();
+	float WindowEnd = 0.0f;
+	if (FindApproachWarpModifier(Montage, &WindowEnd))
+	{
+		EndTime = FMath::Min(EndTime, WindowEnd);
+	}
+	FAnimExtractContext Context(0.0, /*bExtractRootMotion*/ true);
+	const FTransform RootMotion = Montage->ExtractRootMotionFromTrackRange(0.0f, EndTime, Context);
+	return static_cast<float>(RootMotion.GetTranslation().Size2D()) * MeshScale;
+}
+
+const URootMotionModifier_Warp* UVBGA_MeleeAttackBase::FindApproachWarpModifier(const UAnimMontage* Montage, float* OutWindowEndTime)
+{
+	if (!Montage) return nullptr;
+	for (const FAnimNotifyEvent& Event : Montage->Notifies)
+	{
+		const UAnimNotifyState_MotionWarping* WarpState = Cast<UAnimNotifyState_MotionWarping>(Event.NotifyStateClass);
+		const URootMotionModifier_Warp*       Modifier  = WarpState ? Cast<URootMotionModifier_Warp>(WarpState->RootMotionModifier) : nullptr;
+		if (Modifier && Modifier->WarpTargetName == VBMotionWarpingNames::AttackTarget)
+		{
+			if (OutWindowEndTime)
+			{
+				*OutWindowEndTime = Event.GetTriggerTime() + Event.GetDuration();
+			}
+			return Modifier;
+		}
+	}
+	return nullptr;
+}
+
+float UVBGA_MeleeAttackBase::ComputeMinSeparation(const USceneComponent* TargetComponent) const
+{
+	const ACharacter* VBChar = GetAvatarCharacter();
+	if (!VBChar || !TargetComponent) return 0.0f;
+	float MinSeparation = 0.0f;
+	if (const UCapsuleComponent* SelfCap = VBChar->GetCapsuleComponent())
+	{
+		MinSeparation += SelfCap->GetScaledCapsuleRadius();
+	}
+	if (const ACharacter* TargetChar = Cast<ACharacter>(TargetComponent->GetOwner()))
+	{
+		if (const UCapsuleComponent* TargetCap = TargetChar->GetCapsuleComponent())
+		{
+			MinSeparation += TargetCap->GetScaledCapsuleRadius();
+		}
+	}
+	return MinSeparation;
+}
+
+void UVBGA_MeleeAttackBase::ApplyApproachWarpToTarget(const USceneComponent* TargetComponent)
+{
+	ApplyApproachWarpWithOffset(TargetComponent, ComputeApproachOffset(TargetComponent));
+}
+
+void UVBGA_MeleeAttackBase::ApplyApproachWarpWithOffset(const USceneComponent* TargetComponent, float ApproachOffset, bool bFollowTarget)
+{
+	// 락 경로와 소프트 런지 경로가 공유하는 워프 목적지 write(DRY).
+	// 회귀 불변식: 아래 수치 거동은 리팩터 전 SetWarpTargetLockedEnemy 락 경로와 동일해야 한다.
+	// 아바타를 ACharacter 로 받는다(2026-09-15): 적 공격 GA 도 이 경로로 워프를 세운다(design .sw/boss/design.md §12).
+	//   종전 AVBCharacter 캐스트는 플레이어 전용이라 적 몽타주의 SkewWarp 구간이 목표 없이 돌았다.
+	//   컴포넌트는 FindComponentByClass 로 찾는다 - 플레이어는 같은 컴포넌트가 나오므로 거동이 같다.
+	ACharacter* VBChar = GetAvatarCharacter();
+	if (!VBChar || !TargetComponent) return;
+
+	UMotionWarpingComponent* MotionWarpingComponent = VBChar->FindComponentByClass<UMotionWarpingComponent>();
+	if (!MotionWarpingComponent) return;
+
+	// (B) 접근 간격: 워프 목적지를 적 정중앙에서 공격자 쪽으로 WarpApproachOffset 만큼 당겨 무기 리치에서 멈춘다.
+	// 오프셋을 [0, AttackRange]로 clamp — 트레이스가 닿는 범위를 벗어나 헛치는 것을 방지.
+	// 상한이 AttackRange 인 이유: 스윕은 Start 에서 Start+Forward*AttackRange 까지 반경 AttackRadius
+	// 구체를 쓸므로, 적 중심이 정확히 AttackRange 지점에 있어도 끝점 구체가 덮는다. 적 캡슐 반경까지
+	// 더하면 여유는 더 커진다. 종전 상한 AttackRange-AttackRadius 는 필요보다 AttackRadius 만큼 더
+	// 당긴 값이었고, 그 과보수성이 리치가 가장 짧은 무기에서만 실제로 물렸다 — Fighter 는 140-50=90 이
+	// 곧 상한이라 값을 올려도 반영되지 않아 적과 거의 맞닿은 채 싸웠다(2026-08-03 user FEEL).
+	// 카타나(120<150)·대검(120<190)·반격 2종은 종전에도 상한 아래라 이 변경에 거동이 바뀌지 않는다.
+	// (ActiveConfig 는 ExecuteAbility 에서 해석됨. 두 호출자 ExecuteAbility/OnComboWindowClose 모두 이 경로 경유.)
+	// 계측(2026-09-06 user 「회피로 멀어졌을 때 붙는 보정이 없나」): 목표·거리·오프셋·락온 여부를 한 줄로. 닿는 프레임의 거리와 짝을 이룬다.
+	{
+		// 락온 컴포넌트는 플레이어에게만 있다. 적이면 «적» 으로 적어 같은 한 줄이 양쪽 경로를 덮게 한다.
+		const AVBCharacter* PlayerChar = Cast<AVBCharacter>(VBChar);
+		const UVBTargetLockComponent* TLC = PlayerChar ? PlayerChar->GetTargetLockComponent() : nullptr;
+		VB_LOG(Log, "[Warp] %d타 목표=%s 거리=%.0fcm 오프셋=%.0fcm 락온=%s",
+		       ComboIndex + 1, *GetNameSafe(TargetComponent->GetOwner()),
+		       FVector::Dist2D(VBChar->GetActorLocation(), TargetComponent->GetComponentLocation()), ApproachOffset,
+		       !PlayerChar ? TEXT("적") : ((TLC && TLC->IsLockedOn()) ? TEXT("O") : TEXT("X(소프트)")));
+	}
+	// 고정 목표(적): 지금 대상 위치에서 공격자 쪽으로 ApproachOffset 인 점, 대상을 보는 회전. 휘두르는 도중 대상이 물러나도 목표는 안 움직인다 -
+	//   따라가게 두면 오프셋을 정한 대역 계산이 무너져 클립보다 멀리 끌려갔다(design .sw/boss/design.md §16). 회전은 몽타주 SkewWarp 의 Facing 이 이 점을 본다.
+	if (!bFollowTarget)
+	{
+		const FVector TargetLocation = TargetComponent->GetComponentLocation();
+		const FVector ToOwner        = (VBChar->GetActorLocation() - TargetLocation).GetSafeNormal2D();
+		const FVector Goal           = FVector(TargetLocation.X, TargetLocation.Y, VBChar->GetActorLocation().Z) + ToOwner * ApproachOffset;
+		const FRotator Facing        = ToOwner.IsNearlyZero() ? VBChar->GetActorRotation() : (-ToOwner).Rotation();
+		MotionWarpingComponent->AddOrUpdateWarpTargetFromLocationAndRotation(VBMotionWarpingNames::AttackTarget, Goal, Facing);
+		return;
+	}
 	// VectorFromTargetToOwner: LocationOffset.X 를 (적→공격자) 벡터 방향으로 이동 → 적 중심 앞 ApproachOffset cm.
 	// bFollowComponent=true 유지 → 움직이는 적을 매 프레임 추종(정적 스냅샷 없음). RotationOffset=Zero → 회전/발밑 거동 현행 동일.
 	// 전제: 몽타주 SkewWarp bWarpTranslation=1 이어야 이 위치 이동이 실제 착지에 반영된다. 0이면 무효(FIND-035).
@@ -478,26 +800,152 @@ void UVBGA_MeleeAttackBase::ApplyApproachWarpToTarget(const USceneComponent* Tar
 
 void UVBGA_MeleeAttackBase::ClearWarpTarget()
 {
-	if (AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarCharacter()))
+	ResetSwingTarget();
+	// 세우는 쪽(ApplyApproachWarpToTarget)과 같은 탐색 - 적도 지운다.
+	if (ACharacter* Avatar = GetAvatarCharacter())
 	{
-		if (UMotionWarpingComponent* MotionWarpingComponent = VBChar->GetMotionWarpingComponent())
+		if (UMotionWarpingComponent* MotionWarpingComponent = Avatar->FindComponentByClass<UMotionWarpingComponent>())
 			MotionWarpingComponent->RemoveWarpTarget(VBMotionWarpingNames::AttackTarget);
 	}
 }
 
 void UVBGA_MeleeAttackBase::OnComboWindowOpen(FGameplayEventData Payload)
 {
-	bComboWindowOpen = true;
+	ActiveComboWindowNotify = Payload.OptionalObject.Get();
+	bComboWindowOpen   = true;
+	bChainedThisWindow = false;
+
+	// AI 자동 콤보: 공격 자산이 «버튼 없이 잇는다» 고 하면 창이 열리는 순간이 곧 입력이다.
+	//   아래 버퍼·전환 규칙은 그대로 탄다 - 적과 플레이어의 콤보 타이밍 홈이 하나다.
+	if (ActiveConfig && ActiveConfig->bAutoChainCombo && !bSaveAttack)
+	{
+		bSaveAttack = true;
+		VB_LOG(Log, "[Combo] 자동 잇기 - %d타 창 열림", ComboIndex + 1);
+	}
+
+	// 버퍼 소비 (design §3.1): 창이 열리기 전에 눌린 입력은 나이가 버퍼 안이면 지금 쓴다.
+	if (ComboInputTime >= 0.0 && !bSaveAttack)
+	{
+		const double Age    = (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0) - ComboInputTime;
+		const float  Buffer = ActiveConfig ? ActiveConfig->ComboInputBufferSeconds : 0.0f;
+		if (Age <= Buffer)
+		{
+			bSaveAttack = true;
+			VB_LOG(Log, "[Combo] 버퍼 소비 - 입력 나이 %.2f초 (버퍼 %.2f)", Age, Buffer);
+		}
+		else
+		{
+			VB_LOG(Log, "[Combo] 버퍼 만료 - 입력 나이 %.2f초 > %.2f, 버림", Age, Buffer);
+			ComboInputTime = -1.0;
+		}
+	}
+	// 조기 전환 (design §3.2 정정): 창 열림만으로 넘기지 않는다 - 닿음이 지났고 여운이 끝났을 때. 아직이면 닿는 이벤트·타이머가 다시 부른다.
+	TryChainAfterHit();
 }
 
 void UVBGA_MeleeAttackBase::OnComboWindowClose(FGameplayEventData Payload)
 {
-	// 설계: window 끝나는 시점(= 현재 section 후반부)에 저장된 입력을 소비해 다음 section으로 전환.
-	// 원래 설계 타이밍 — 콤보 리듬감 유지.
+	// 점프가 옛 창의 끝을 늦게 보내도 새 창의 입력/상태를 소비하지 않는다.
+	if (Payload.OptionalObject.Get())
+	{
+		if (Payload.OptionalObject.Get() != ActiveComboWindowNotify.Get()) return;
+		ActiveComboWindowNotify.Reset();
+		if (Payload.EventMagnitude <= 0.0f)
+		{
+			bComboWindowOpen = false;
+			return; // 취소된 창은 다음 공격으로 잇거나 복귀를 취소할 수 없다.
+		}
+	}
 	bComboWindowOpen = false;
 
-	if (!bSaveAttack) return;
-	if (!ActiveConfig || ComboIndex >= ActiveConfig->MaxComboCount - 1) return;
+	// 섹션 점프가 낸 옛 창의 닫힘 - 이미 다음 타로 넘어갔으므로 아무것도 하지 않는다.
+	if (bChainedThisWindow)
+	{
+		bChainedThisWindow = false;
+		return;
+	}
+	// 닫힐 때 전환: bChainAtWindowOpen 이 꺼진 무기, 또는 창 안 입력이 아직 소비되지 않은 경우.
+	// 종전(2026-09-05 이전)에는 이것이 유일한 전환 시점이었다 - «콤보 리듬감» 을 위한 선택이었으나 최대 0.3초 늦게 반응했다.
+	if (bSaveAttack && TryChainToNextSection())
+	{
+		bChainedThisWindow = false;   // 이 닫힘이 곧 옛 창이라 추가 닫힘은 오지 않는다
+		return;
+	}
+	// 회복 캔슬 (design §3.3): 다음 타가 없으면 여기서 자유롭게 한다. 종전엔 섹션 끝까지 굳었다(카타나 0.57~1.38초).
+	if (ActiveConfig && ActiveConfig->bCancelRecoveryAtWindowClose)
+	{
+		CancelRecovery();
+	}
+}
+
+bool UVBGA_MeleeAttackBase::TryOpenFinisher(const FGameplayAbilityActorInfo* ActorInfo)
+{
+	if (!bCanOpenFinisher)
+	{
+		return false;
+	}
+	// 서버에서만 쏜다 - 처형은 대상 선정·즉사 피해·명성이 전부 서버 몫이다(UVBGA_Execute 첫머리).
+	if (!ActorInfo || !ActorInfo->IsNetAuthority())
+	{
+		return false;
+	}
+
+	UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo();
+	if (!OwnerASC)
+	{
+		return false;
+	}
+
+	FGameplayEventData Payload;
+	Payload.EventTag   = VBGameplayTags::Event_Combat_ExecuteRequested;
+	Payload.Instigator = ActorInfo->AvatarActor.Get();
+
+	// ★대상과 사거리를 여기서 판정하지 않는다.★ 그것은 UVBGA_Execute 의 설정
+	//   (UVBMedicalConfig::MedicalRange)이 정하고, 이벤트를 받은 그쪽이 FindFinisherTarget 으로 최종
+	//   판단한다. 여기서 같은 판정을 한 벌 더 하면 두 사거리가 어긋나는 날 「가끔 안 걸린다」가 된다.
+	// 성공 여부는 «활성화된 어빌리티 수» 로 받는다 - 0 이면 안 열린 것이고 부르는 쪽이 제 갈 길 간다.
+	if (OwnerASC->HandleGameplayEvent(Payload.EventTag, &Payload) <= 0)
+	{
+		return false;
+	}
+
+	VB_LOG(Log, "%s: 처형 창이 열려 있어 공격 대신 처형으로 넘긴다 (%d타)", *GetName(), ComboIndex + 1);
+	return true;
+}
+
+bool UVBGA_MeleeAttackBase::TryChainToNextSection()
+{
+	if (!bSaveAttack) return false;
+
+	// ★자동 체인용 관문★ — 입력으로 들어온 것은 OnComboInputReceived 가 이미 «즉시» 잡는다.
+	// 여기가 남는 이유는 bAutoChainCombo 다: 그 설정이 켜진 무기는 입력 없이도 다음 타로 이어지므로
+	// 입력 관문을 지나가지 않는다. 그 경로에도 처형이 열려야 한다.
+	// (관문이 셋인 이유 = 첫 타 / 입력 / 자동 체인. 상태가 넘어가는 자리가 셋이다.)
+	if (TryOpenFinisher(GetCurrentActorInfo()))
+	{
+		bSaveAttack    = false;
+		ComboInputTime = -1.0;
+		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo,
+		           /*bReplicateEndAbility=*/true, /*bWasCancelled=*/false);
+		// true 를 돌려주는 이유: 부르는 쪽(창 닫힘 처리)이 «넘겼다» 로 보고 회복 캔슬 같은
+		//   뒷정리를 건너뛰게 하려는 것이다. 어빌리티가 이미 끝났으므로 그 정리는 의미가 없다.
+		return true;
+	}
+	if (!ActiveConfig || ComboIndex >= ActiveConfig->MaxComboCount - 1)
+	{
+		bSaveAttack    = false;   // 마지막 타 뒤의 입력은 버린다 - 다음 활성화가 처음부터 시작
+		ComboInputTime = -1.0;
+		return false;
+	}
+	bChainedThisWindow = true;   // 아래 점프가 옛 창의 닫힘을 동기로 낼 수 있으므로 먼저 세운다
+	ActiveComboWindowNotify.Reset();
+	bComboWindowOpen   = false;
+	bHitFrameReached   = false;  // 다음 섹션의 닿음은 아직
+	HitFrameTime       = -1.0;
+	if (UWorld* World = GetWorld()) { World->GetTimerManager().ClearTimer(ChainDelayTimer); }
+	// 옛 타의 판정 창은 여기서 끝난다. 점프 뒤 엔진이 옛 창의 끝 알림을 내지만 그때는 닫을 것이 없다.
+	//   조기 전환이 창의 뒤쪽을 자른다는 뜻이다 - ChainDelayAfterHitSeconds 는 «창 시작 → 칼이 실제로 닿는 시각» 보다 길어야 한다(설계 16절).
+	EndAllTraceWindows();
 
 	SetWarpTargetLockedEnemy();
 	// 다음 콤보 섹션: ActiveConfig->ComboSectionNames 배열 우선(무기별 섹션명 대응),
@@ -528,17 +976,111 @@ void UVBGA_MeleeAttackBase::OnComboWindowClose(FGameplayEventData Payload)
 		}
 	}
 
+	VB_LOG(Log, "[Combo] 전환 - %d타 -> %d타(%s)", ComboIndex + 1, ComboIndex + 2, *NextSection.ToString());
 	ComboIndex++;
-	bSaveAttack = false;
+	bSaveAttack    = false;
+	ComboInputTime = -1.0;
+	return true;
+}
+
+void UVBGA_MeleeAttackBase::CancelRecovery()
+{
+	const float Blend = ActiveConfig ? ActiveConfig->RecoveryBlendOutSeconds : 0.15f;
+
+	// 캔슬 시점의 이동 상태를 함께 찍는다. 몽타주를 자연 종료보다 일찍 끊으므로 그 순간의 루트모션 속도가
+	//   캡슐에 남을 수 있고, 남으면 모션매칭 쿼리가 그 구간을 «달리는 중» 으로 읽는다.
+	//   정적 실측(2026-09-07): AM_LightAttack 3타의 창 닫힘은 클립 루트모션 203cm/s 지점이다(1/2/4타는 85/12/87).
+	AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarActorFromActorInfo());
+	const UCharacterMovementComponent* CancelCMC = VBChar ? VBChar->GetCharacterMovement() : nullptr;
+	VB_LOG(Log, "[Combo] 회복 캔슬 - %d타 창 닫힘, %.2f초 블렌드아웃 (Speed2D %.0f, 가속 %.0f)",
+	       ComboIndex + 1, Blend,
+	       CancelCMC ? CancelCMC->Velocity.Size2D() : -1.0f,
+	       CancelCMC ? CancelCMC->GetCurrentAcceleration().Size2D() : -1.0f);
+	if (VBChar)
+	{
+		VBChar->BeginRecoveryCancelTrace();
+
+		// 이동 입력이 없으면 남은 이동은 플레이어 의도가 아니다 - 버린다.
+		//   입력이 있으면 그 속도는 의도한 관성이므로 건드리지 않는다(회피·이동 캔슬로 이어지는 경로).
+		if (CancelCMC && CancelCMC->GetCurrentAcceleration().IsNearlyZero())
+		{
+			VBChar->StopResidualAttackMotion(Blend, ActiveMontage);
+		}
+	}
+	ClearWarpTarget();
+	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo())
+	{
+		ASC->CurrentMontageStop(Blend);
+	}
+	EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
+}
+
+EVBWeaponType UVBGA_MeleeAttackBase::GetCurrentWeaponType() const
+{
+	if (const AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarActorFromActorInfo()))
+	{
+		if (const UVBWeaponStateComponent* WSC = VBChar->GetWeaponStateComponent())
+		{
+			return WSC->GetCurrentWeaponType();
+		}
+	}
+	return EVBWeaponType::None;
+}
+
+void UVBGA_MeleeAttackBase::GrantSuperArmorOnce()
+{
+	if (bGrantedSuperArmor)
+	{
+		return;
+	}
+	if (UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo())
+	{
+		// 복제 상태를 명시한다. 생략하면 EGameplayTagReplicationState::None 이 되는데,
+		//   그것은 이 프로젝트에서 이 한 곳만 쓰던 값이었다(나머지 로스태그 6곳은 전부 CountToOwner).
+		//   판정 자체는 서버에서만 도므로 동작은 안 바뀌고, 같은 종류의 태그가 같은 규약을 갖게 된다.
+		OwnerASC->AddLooseGameplayTag(VBGameplayTags::State_Combat_SuperArmor, 1,
+		                              EGameplayTagReplicationState::CountToOwner);
+		bGrantedSuperArmor = true;
+	}
+}
+
+UVBAttackConfig* UVBGA_MeleeAttackBase::ResolveMovesetLeaf() const
+{
+	// 적(AVBCharacter 아님)은 무기 타입이 None 이라 leaf 가 없다 - 레거시 AttackConfig 폴백. 종전 동작 그대로다.
+	return MovesetConfig ? MovesetConfig->GetAttackConfig(GetCurrentWeaponType()) : nullptr;
+}
+
+const UVBAttackConfig* UVBGA_MeleeAttackBase::PeekAttackConfig() const
+{
+	const UVBAttackConfig* Leaf = ResolveMovesetLeaf();
+	return Leaf ? Leaf : AttackConfig.Get();
 }
 
 void UVBGA_MeleeAttackBase::OnComboInputReceived(FGameplayEventData Payload)
 {
-	// 입력을 저장만 함. 실제 section 전환은 OnComboWindowClose 시점에 일괄 실행.
-	// window 중 여러 번 눌러도 한 번만 저장 (idempotent).
+	// ★처형은 콤보 리듬을 기다리지 않는다 — 입력 «순간» 에 묻는다.	//
+	// 왜 여기가 필요한가(2026-09-19 user PIE 2회차): 관문을 TryChainToNextSection 에만 뒀더니
+	//   콤보 중 전환이 「살짝 슬로우 걸린 것처럼」 나왔다. 그 경로가 입력에서 바로 오지 않기
+	//   때문이다 — OnComboInputReceived -> TryChainAfterHit 이 ChainDelayAfterHitSeconds 만큼
+	//   ★타이머로 기다린 뒤★ 다음 섹션으로 넘긴다(창이 안 열렸으면 열릴 때까지 더 기다린다).
+	//   그 지연은 «콤보 리듬감» 을 위해 일부러 넣은 것이고 처형에는 해당되지 않는다.
+	// 창이 열렸는지도 보지 않는다: 처형은 콤보 타이밍의 일부가 아니다.
+	if (TryOpenFinisher(GetCurrentActorInfo()))
+	{
+		bSaveAttack    = false;
+		ComboInputTime = -1.0;
+		if (UWorld* World = GetWorld()) { World->GetTimerManager().ClearTimer(ChainDelayTimer); }
+		EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo,
+		           /*bReplicateEndAbility=*/true, /*bWasCancelled=*/false);
+		return;
+	}
+
+	// 입력 버퍼 (design §3.1): 창과 무관하게 시각을 기억한다. 창이 열려 있으면 즉시 전환(§3.2), 아니면 열릴 때 나이로 판정.
+	ComboInputTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	if (bComboWindowOpen)
 	{
 		bSaveAttack = true;
+		TryChainAfterHit();
 	}
 }
 
@@ -663,23 +1205,19 @@ FVBSwingCombatScales UVBGA_MeleeAttackBase::ResolveSwingCombatScales() const
 	return FVBSwingCombatScales();
 }
 
-void UVBGA_MeleeAttackBase::PerformAttackTrace()
+bool UVBGA_MeleeAttackBase::BuildSwingHitContext(FSwingHitContext& OutContext) const
 {
-	// 서버 권위 함수: Trace + GE(Damage) 적용.
-	// ServerInitiated로 전환된 이상 클라에서도 호출될 가능성이 있으므로 입구에서 차단.
-	// (ExecuteAbility와 OnAttackTraceEvent 쪽 호출자 가드 이중화 — 미래 새 호출자 추가 시에도 안전)
-	if (!CurrentActorInfo || !CurrentActorInfo->IsNetAuthority())
-	{
-		return;
-	}
-
-	ACharacter* AvatarCharacter = GetAvatarCharacter();
+	const ACharacter* AvatarCharacter = GetAvatarCharacter();
 	if (!AvatarCharacter || !ActiveConfig || !ActiveConfig->DamageEffectClass)
 	{
-		return;
+		return false;
+	}
+	const UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo();
+	if (!OwnerASC)
+	{
+		return false;
 	}
 
-	// Trace 시작/끝 위치
 	const FVector Start = AvatarCharacter->GetActorLocation();
 
 	// 조준 보정: 겨눈 대상이 AimAssistMaxAngle 안에 있으면 판정을 그쪽으로 돌린다.
@@ -707,7 +1245,8 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 			}
 		}
 	}
-	const FVector End = Start + (Forward * ActiveConfig->AttackRange);
+	// 판정 창에서는 칼 궤적이 판정이라 이 정면은 넉백 방향과 옛 구 스윕에만 쓰인다. 창이 열릴 때 한 번 정한다(설계 7절).
+	OutContext.Forward = Forward;
 
 	// 넉백이 밀 방향. 이 스윙이 실제로 나간 방향과 같아야 한다.
 	// 왜 여기서 한 번만 구하나: 대상 루프 안에서 대상마다 구하면 다중 타격에서 적들이 방사형으로
@@ -726,7 +1265,55 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 	//   AimAssistMaxAngle 만큼 꺾어 놓는데 넉백만 안 꺾이면 그만큼 어긋난다.
 	FVector KnockbackDir = Forward;
 	KnockbackDir.Z = 0.0f;
-	const float KnockbackYaw = KnockbackDir.IsNearlyZero() ? 0.0f : KnockbackDir.Rotation().Yaw;
+	OutContext.KnockbackYaw = KnockbackDir.IsNearlyZero() ? 0.0f : KnockbackDir.Rotation().Yaw;
+
+	// 이번 스윙의 전투 수치 배율. 대상 루프 진입 전에 한 번만 해석한다 - 넉백 방향을 루프 밖에서
+	//  한 번만 구하는 것과 같은 이유다. 스윙 한 번의 무게는 맞은 대상 수와 무관하게 하나여야 한다.
+	OutContext.SwingScales = ResolveSwingCombatScales();
+
+	// 이번 스윙이 선언하는 반응 등급(DEC-025). 스윙 프로필이 덮었으면 그것, 아니면 무기 leaf 값.
+	//  배율과 같은 이유로 루프 밖에서 한 번만 정한다 - 한 스윙의 무게는 대상 수와 무관하게 하나다.
+	//  받는 쪽 저항은 여기서 안 본다. 그것은 피격자 허브가 한다(대상마다 저항이 다르다).
+	OutContext.SwingImpact = (ActiveSwingCombatProfile && ActiveSwingCombatProfile->bOverrideHitImpact)
+		? ActiveSwingCombatProfile->HitImpact
+		: ActiveConfig->HitImpact;
+
+	// 최종 데미지. 변형 배율을 곱한다 - 타격 수가 다른 변형끼리 총 데미지를 맞추기 위한 것이다(DamageScale 주석 참조).
+	// 스윙 배율이 마지막 층이다 - 캐릭터/무기/변형/스윙 네 층은 입도가 각각 달라서 나뉘어 있다.
+	OutContext.AttackPower = OwnerASC->GetNumericAttribute(UVBCombatAttributeSet::GetAttackPowerAttribute());
+	OutContext.FinalDamage =
+		OutContext.AttackPower * ActiveConfig->DamageMultiplier * ActiveVariantDamage * OutContext.SwingScales.DamageScale;
+
+	// 노티 프로필은 노티마다 덮어써지는 GA 멤버라, 창이 열린 동안 다른 창이 덮어쓸 수 있다. 이 스윙 것을 붙들어 둔다.
+	OutContext.ImpactProfile = ResolveSwingImpactProfile();
+	OutContext.CombatProfile = ActiveSwingCombatProfile.Get();
+	return true;
+}
+
+void UVBGA_MeleeAttackBase::PerformAttackTrace()
+{
+	// 서버 권위 함수: Trace + GE(Damage) 적용.
+	// ServerInitiated로 전환된 이상 클라에서도 호출될 가능성이 있으므로 입구에서 차단.
+	// (ExecuteAbility와 OnAttackTraceEvent 쪽 호출자 가드 이중화 — 미래 새 호출자 추가 시에도 안전)
+	if (!CurrentActorInfo || !CurrentActorInfo->IsNetAuthority())
+	{
+		return;
+	}
+
+	ACharacter* AvatarCharacter = GetAvatarCharacter();
+	FSwingHitContext Context;
+	if (!AvatarCharacter || !BuildSwingHitContext(Context))
+	{
+		return;
+	}
+
+	// Trace 시작/끝 위치
+	const FVector  Start   = AvatarCharacter->GetActorLocation();
+	const FVector& Forward = Context.Forward;
+	// 사거리·반경은 애니 고유 단위라 공격자 몸 배율을 곱한다(UVBAttackConfig::GetScaledAttackRange 주석) - 큰 보스는 같은 클립으로 더 멀리 닿는다.
+	const float   BodyScale    = AVBEnemyBase::ResolveStrideScale(AvatarCharacter);
+	const float   TraceRadius  = ActiveConfig->GetScaledAttackRadius(BodyScale);
+	const FVector End = Start + (Forward * ActiveConfig->GetScaledAttackRange(BodyScale));
 
 	// SphereTrace 설정
 	FCollisionQueryParams QueryParams;
@@ -740,7 +1327,7 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 	                                                                   FQuat::Identity,
 	                                                                   ActiveConfig->HitTraceChannel,
 	                                                                   // 반경도 ActiveConfig 기준 (레거시 AttackConfig 직접 참조 시 Moveset-only 할당에서 null deref + 반경 불일치)
-	                                                                   FCollisionShape::MakeSphere(ActiveConfig->AttackRadius),
+	                                                                   FCollisionShape::MakeSphere(TraceRadius),
 	                                                                   QueryParams);
 
 
@@ -753,9 +1340,9 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 		const float    Half = FMath::Max((End - Start).Size() * 0.5f, KINDA_SMALL_NUMBER);
 		const FQuat    Rot  = FRotationMatrix::MakeFromZ(Forward).ToQuat();
 		const FColor   Col  = bHit ? FColor::Red : FColor::Green;
-		DrawDebugCapsule(AvatarCharacter->GetWorld(), Mid, Half, ActiveConfig->AttackRadius, Rot, Col, false, 1.0f);
-		DrawDebugSphere(AvatarCharacter->GetWorld(), Start, ActiveConfig->AttackRadius, 12, Col, false, 1.0f);
-		DrawDebugSphere(AvatarCharacter->GetWorld(), End,   ActiveConfig->AttackRadius, 12, Col, false, 1.0f);
+		DrawDebugCapsule(AvatarCharacter->GetWorld(), Mid, Half, TraceRadius, Rot, Col, false, 1.0f);
+		DrawDebugSphere(AvatarCharacter->GetWorld(), Start, TraceRadius, 12, Col, false, 1.0f);
+		DrawDebugSphere(AvatarCharacter->GetWorld(), End,   TraceRadius, 12, Col, false, 1.0f);
 		for (const FHitResult& H : HitResults)
 		{
 			if (H.GetActor())
@@ -780,31 +1367,48 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 		return;
 	}
 
-	// 1. AttackPower 가져오기
-	UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo();
-	if (!OwnerASC) return;
+	ApplySwingHits(HitResults, Context);
+}
 
-	float AttackPower = 0.0f;
-
-	AttackPower = OwnerASC->GetNumericAttribute(UVBCombatAttributeSet::GetAttackPowerAttribute());
-
-
-	// 이번 스윙의 전투 수치 배율. 대상 루프 진입 전에 한 번만 해석한다 - 넉백 방향을 루프 밖에서
-	//  한 번만 구하는 것과 같은 이유다. 스윙 한 번의 무게는 맞은 대상 수와 무관하게 하나여야 한다.
-	const FVBSwingCombatScales SwingScales = ResolveSwingCombatScales();
-
-	// 2. 최종 데미지 계산
-	// 변형 배율을 곱한다. 타격 수가 다른 변형끼리 총 데미지를 맞추기 위한 것이다(DamageScale 주석 참조).
-	// 스윙 배율이 마지막 층이다 - 캐릭터/무기/변형/스윙 네 층은 입도가 각각 달라서 나뉘어 있다.
-	const float FinalDamage =
-		AttackPower * ActiveConfig->DamageMultiplier * ActiveVariantDamage * SwingScales.DamageScale;
-
-	TSet<AActor*> ProcessedActors;
-	bool bAutoLockedThisSwing = false; // 스윙당 자동 락온 1회 가드(첫 유효 데미지 타겟이 시도권)
-
-	// 3. 맞은 대상마다 Spec/Context/GE/큐를 개별 처리
-	for (const FHitResult& Hit : HitResults)
+void UVBGA_MeleeAttackBase::ApplySwingHits(const TArray<FHitResult>& Hits, FSwingHitContext& Context)
+{
+	// 두 판정 경로(옛 구 스윕·판정 창) 모두 서버에서만 여기 온다. 새 호출자가 생겨도 클라가 피해를 내지 않게 입구에서 한 번 더 막는다(FIND-085).
+	if (!CurrentActorInfo || !CurrentActorInfo->IsNetAuthority())
 	{
+		return;
+	}
+	ACharacter* AvatarCharacter = GetAvatarCharacter();
+	UAbilitySystemComponent* OwnerASC = GetAbilitySystemComponentFromActorInfo();
+	if (!AvatarCharacter || !OwnerASC || !ActiveConfig || !ActiveConfig->DamageEffectClass)
+	{
+		return;
+	}
+
+	// 스윙 값은 문맥에서 온다 - 창이면 창이 열릴 때 정한 값이다. 아래 대상별 처리는 옛 PerformAttackTrace 의 루프 그대로다.
+	const FVBSwingCombatScales& SwingScales = Context.SwingScales;
+	const float        FinalDamage  = Context.FinalDamage;
+	const float        KnockbackYaw = Context.KnockbackYaw;
+	const EVBHitImpact SwingImpact  = Context.SwingImpact;
+
+	// 이번 호출에서 데미지를 준 액터. 옛 구 스윕은 한 액터에서 히트가 여럿 나오므로 필요하다.
+	//   판정 창은 컴포넌트가 이미 표적당 하나로 묶어 보내고, 창 안의 중복(다단 히트 간격 포함)도 컴포넌트가 가른다.
+	TSet<AActor*> ProcessedActors;
+
+	// 표적에 효과를 거는 것이 이 스윙을 끊을 수 있다 - 패링이 공격자를 경직시키면 EndAbility 가 그 자리에서 돈다.
+	//   끊겼으면 그 표적의 남은 처리(락온·큐)와 남은 표적, 첫 접촉 히트스톱·쉐이크를 모두 멈춘다(옛 한 프레임 판정 루프부터 있던 구멍, Codex 리뷰 2026-09-30).
+	//   이 GA 는 액터당 한 인스턴스라 끊긴 뒤 같은 호출 안에서 다시 켜질 수 있다 - 활성 여부만 보면 새 활성화를 옛 스윙으로 잇는다. 활성화 번호까지 본다.
+	const uint32 SwingActivation = ActivationSerial;
+	const auto IsSameSwing = [this, SwingActivation]() { return IsActive() && ActivationSerial == SwingActivation; };
+	bool bSwingCut = false;
+
+	// 맞은 대상마다 Spec/Context/GE/큐를 개별 처리
+	for (const FHitResult& Hit : Hits)
+	{
+		if (!IsSameSwing())
+		{
+			bSwingCut = true;
+			break;
+		}
 		AActor* HitActor = Hit.GetActor();
 		if (!HitActor)
 		{
@@ -887,14 +1491,48 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 		//     스윙 단위 보정(FVBSwingCombatScales)에는 poise 축이 없다. 없는 축을 지어내면 홈이 둘이 된다.
 		SpecHandle.Data.Get()->SetSetByCallerMagnitude(
 		                                               VBGameplayTags::Data_PoiseDamage, ActiveConfig->PoiseDamage);
+		//     (F) 반응 등급과 띄우는 높이(DEC-025). 넉백·기절 게이지 피해와 같은 운반 방식이다. 등급은 enum 서수로 싣고
+		//     받는 쪽 허브가 저항을 빼서 실효 등급을 정한다 - 공격자는 대상의 저항을 모른다.
+		SpecHandle.Data.Get()->SetSetByCallerMagnitude(
+		                                               VBGameplayTags::Data_HitImpact, static_cast<float>(SwingImpact));
+		SpecHandle.Data.Get()->SetSetByCallerMagnitude(
+		                                               VBGameplayTags::Data_LaunchHeight, ActiveConfig->LaunchHeight);
+		//     (E) 답 태그(design §11). 피격자 허브가 DodgeOnly 를 읽어 가드·패링을 건너뛴다.
+		//     예고 큐가 색으로 한 «약속» 과 같은 자산 값이라 이행이 어긋날 수 없다. 스펙의 동적 태그는 복제되지 않지만
+		//     허브 판정은 서버에서만 돈다.
+		if (ActiveConfig->AttackAnswer.IsValid())
+		{
+			SpecHandle.Data.Get()->AddDynamicAssetTag(ActiveConfig->AttackAnswer);
+		}
+		// 겹침/무적/완전 방어만으로 카메라가 돌지 않게 실제 체력 또는 실드 감소를 확인한다.
+		const float HealthBefore = TargetASC->GetNumericAttribute(UVBHealthAttributeSet::GetHealthAttribute());
+		const float ShieldBefore = TargetASC->GetNumericAttribute(UVBHealthAttributeSet::GetShieldAttribute());
 		TargetASC->ApplyGameplayEffectSpecToSelf(*SpecHandle.Data.Get());
+		const bool bDealtDamage = TargetASC->GetNumericAttribute(UVBHealthAttributeSet::GetHealthAttribute()) < HealthBefore ||
+			TargetASC->GetNumericAttribute(UVBHealthAttributeSet::GetShieldAttribute()) < ShieldBefore;
+		if (!IsSameSwing())
+		{
+			bSwingCut = true;
+			break;
+		}
 
-		ApplyAdditionalEffects(TargetASC, Hit);
+		// 피해가 0 인 타격(패링·회피 무적)에는 추가 효과(출혈 등)를 걸지 않는다(피격 반응 갈래 판단 2026-09-30).
+		//   가드 감쇠 타격은 피해가 0 보다 커서 여기서 못 가른다 - 가드 브레이크 단계(DEC-025 단계 3)에서 정한다.
+		if (bDealtDamage)
+		{
+			ApplyAdditionalEffects(TargetASC, Hit);
+			if (!IsSameSwing())
+			{
+				bSwingCut = true;
+				break;
+			}
+		}
 
 		// 자동 락온: 이 스윙이 처음 유효 데미지를 준 적으로 락 시도(서버 권위).
 		// 적 아바타는 AVBCharacter 가 아니므로 Cast 실패 → 구조적 제외. 컴포넌트 getter 도 null-safe.
 		// 시도 후(수락/거절 무관) 잠금 → 뒤따르는 다중 히트 타겟이 락을 훔치지 않게(결정론적 '첫 타겟').
-		if (!bAutoLockedThisSwing)
+		//   판정 창에서는 창의 첫 표적이다 - 뒤 프레임에 새로 맞는 표적도 락을 훔치지 않는다.
+		if (!Context.bAutoLocked)
 		{
 			if (AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarCharacter()))
 			{
@@ -903,7 +1541,15 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 					TLC->TryAutoLockOnTarget(HitActor);
 				}
 			}
-			bAutoLockedThisSwing = true;
+			Context.bAutoLocked = true;
+		}
+
+		if (bDealtDamage && !Context.bCameraReported)
+		{
+			if (AVBCharacter* VBChar = Cast<AVBCharacter>(AvatarCharacter))
+				if (UVBTargetLockComponent* TLC = VBChar->GetTargetLockComponent())
+					TLC->NotifyMeleeHitForCamera(HitActor);
+			Context.bCameraReported = true;
 		}
 
 		// 큐는 루프 '안'에서 대상마다 실행한다 (구 코드는 루프 밖 1회 → 광역 시 1명만 반응)
@@ -918,29 +1564,38 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 		// 곱셈 사슬을 통째로 남긴다. 이 줄이 없어서 "데미지가 세진 것 같다"를 정적 감사로만 쫓아야 했고,
 		//  네 층 중 어디가 움직였는지 알 수 없었다(2026-08-10). 최종 수치는 게임에서 제일 중요한 숫자인데
 		//  관측 지점이 하나도 없던 것이 결함이다. 적중한 스윙에서만 나오므로 헛스윙 노이즈는 없다.
-		VB_LOG(Log, "%s: 데미지 %.1f = AttackPower %.1f x cfg %.2f x variant %.2f x swing %.2f (대상 %d)",
-		       *GetName(), FinalDamage, AttackPower, ActiveConfig->DamageMultiplier,
-		       ActiveVariantDamage, SwingScales.DamageScale, ProcessedActors.Num());
+		VB_LOG(Log, "%s: 데미지 %.1f = AttackPower %.1f x cfg %.2f x variant %.2f x swing %.2f (대상 %d) / 선언 등급 %s",
+		       *GetName(), FinalDamage, Context.AttackPower, ActiveConfig->DamageMultiplier,
+		       ActiveVariantDamage, SwingScales.DamageScale, ProcessedActors.Num(), VBHitImpactName(SwingImpact));
 
 		// 저작한 스윙에서만 1줄. 미저작이 정상 상태이므로 매 스윙 로그는 노이즈다.
 		//  꽂았는데 이 줄이 안 뜨면 배선이 안 된 것 - 그것이 이 로그의 유일한 목적이다.
-		if (ActiveSwingCombatProfile)
+		if (const UVBSwingCombatProfile* CombatProfile = Context.CombatProfile.Get())
 		{
-			VB_LOG(Log, "%s: 스윙 배율 적용 profile=%s dmg=%.2f kbS=%.2f kbZ=%.2f hitstop=%.2f",
-			       *GetName(), *ActiveSwingCombatProfile->GetName(),
+			VB_LOG(Log, "%s: 스윙 배율 적용 profile=%s dmg=%.2f kbS=%.2f kbZ=%.2f hitstop=%.2f impact=%s",
+			       *GetName(), *CombatProfile->GetName(),
 			       SwingScales.DamageScale, SwingScales.KnockbackStrengthScale,
-			       SwingScales.KnockbackZScale, SwingScales.HitStopDurationScale);
+			       SwingScales.KnockbackZScale, SwingScales.HitStopDurationScale,
+			       CombatProfile->bOverrideHitImpact ? VBHitImpactName(CombatProfile->HitImpact) : TEXT("상속"));
 		}
+	}
 
-		// 히트스톱은 전역 시간 감속이라 대상 수와 무관하게 1회만 — 루프 밖 유지.
+	// 히트스톱과 스윙 쉐이크는 스윙의 첫 접촉에서 한 번만 낸다(설계 7절).
+	//   옛 구 스윕은 호출 한 번이 곧 스윙이라 종전과 같다. 판정 창에서 뒤 프레임에 새로 맞는 표적은 피해·반응만 받는다 -
+	//   창 동안 여러 번 걸면 공격자가 멈췄다 풀렸다를 반복해 스윙이 끊겨 보인다. 뒤 표적도 멈출지는 체감 확인 뒤 정한다.
+	if (ProcessedActors.Num() > 0 && !Context.bContactFinished && !bSwingCut)
+	{
+		Context.bContactFinished = true;
+
+		// 히트스톱은 대상 수와 무관하게 1회만 — 루프 밖 유지. 맞은 액터 전부를 실어 «전투원만» 멈추게 한다(design §8).
 		PlayHitStop(ActiveConfig->HitStopDuration * SwingScales.HitStopDurationScale,
-		            ActiveConfig->HitStopTimeDilation);
+		            ActiveConfig->HitStopTimeDilation, ProcessedActors.Array(), ActiveConfig);
 
 		// 방향성 임팩트 쉐이크도 같은 이유로 루프 밖 1회다.
 		// 파티클과 사운드는 맞은 대상마다 나야 옳지만 카메라는 대상 수와 무관하게 하나뿐이다.
 		//  루프 안에서 쏘면 적 2체를 동시에 벨 때 쉐이크가 두 번 겹쳐 세기가 두 배가 된다
 		//  — 지금 GCN_DamagePhysical BP 의 쉐이크 노드가 정확히 그 상태이고, 이 위치가 그것을 구조적으로 없앤다.
-		if (const UVBSwingImpactProfile* Profile = ResolveSwingImpactProfile())
+		if (const UVBSwingImpactProfile* Profile = Context.ImpactProfile.Get())
 		{
 			// 왜 위에서 만든 Forward 를 쓰지 않는가: Forward 는 AimAssist 로 꺾인 판정 방향이지 스윙 방향이 아니다.
 			//  조준 보정이 내려베기를 옆으로 바꿔 버리면 안 된다. 밀림 방향의 근거는 아바타의 자세 하나뿐이다.
@@ -962,6 +1617,125 @@ void UVBGA_MeleeAttackBase::PerformAttackTrace()
 			// Verbose 가 아니라 Warning 인 이유: BP 의 쉐이크 노드를 제거했으므로 미저작은 정상 상태가 아니라
 			//  "쉐이크가 통째로 사라진" 설정 오류다. 노티와 leaf 어느 쪽에도 프로필이 없다는 뜻이다.
 			VB_LOG(Warning, "%s: SwingImpactProfile 미할당(노티/leaf 모두) - 임팩트 쉐이크 스킵", *GetName());
+		}
+	}
+}
+
+UVBMeleeTraceComponent* UVBGA_MeleeAttackBase::GetMeleeTraceComponent() const
+{
+	const AActor* Avatar = GetAvatarActorFromActorInfo();
+	return Avatar ? Avatar->FindComponentByClass<UVBMeleeTraceComponent>() : nullptr;
+}
+
+void UVBGA_MeleeAttackBase::BeginTraceWindow(const FGameplayEventData& Payload)
+{
+	if (!CurrentActorInfo || !CurrentActorInfo->IsNetAuthority())
+	{
+		return;
+	}
+
+	FGameplayTag Shape;
+	for (const FGameplayTag& Tag : Payload.InstigatorTags)
+	{
+		if (Tag.MatchesTag(VBGameplayTags::Melee_Shape) && Tag != VBGameplayTags::Melee_Shape)
+		{
+			Shape = Tag;
+			break;
+		}
+	}
+
+	// 못 여는 경우는 옛 구 스윕으로 떨어진다. 몽타주는 창으로 바꿨는데 그 몽타주를 쓰는 캐릭터에 컴포넌트·모양이 아직 없을 때다
+	//   (변환은 캐릭터별로 나눠 한다 - 설계 12절). 조용히 피해가 사라지면 «칼이 안 맞는다» 로만 보여 원인을 못 찾는다. 경고는 매 스윙 낸다.
+	UVBMeleeTraceComponent* Trace = GetMeleeTraceComponent();
+	if (!Trace || !Shape.IsValid())
+	{
+		VB_LOG(Warning, "%s: 판정 창인데 %s - 옛 구 판정으로 대신한다", *GetName(),
+		       !Trace ? TEXT("아바타에 UVBMeleeTraceComponent 가 없다") : TEXT("노티에 모양 태그가 없다"));
+		PerformAttackTrace();
+		return;
+	}
+
+	FSwingHitContext Context;
+	if (!BuildSwingHitContext(Context))
+	{
+		return;   // 옛 판정도 이 경우 조용히 끝났다 - 피해를 낼 수 없는 공격(피해 GE 없음 등)
+	}
+
+	const int32 Key = NextTraceWindowKey++;
+	const int32 WindowId = Trace->BeginWindow(Shape, Payload.EventMagnitude,
+	                                          FVBMeleeTraceHits::CreateUObject(this, &ThisClass::OnTraceWindowHits, Key));
+	if (WindowId == INDEX_NONE)
+	{
+		// 컴포넌트가 이유를 이미 경고했다(모양 없음·뼈 없음).
+		VB_LOG(Warning, "%s: 판정 창 %s 을 못 열었다 - 옛 구 판정으로 대신한다", *GetName(), *Shape.ToString());
+		PerformAttackTrace();
+		return;
+	}
+
+	FOpenTraceWindow& Open = OpenTraceWindows.AddDefaulted_GetRef();
+	Open.Key      = Key;
+	Open.WindowId = WindowId;
+	Open.Shape    = Shape;
+	Open.Context  = MoveTemp(Context);
+	VB_LOG(Log, "%s: 판정 창 열림 - %d타 %s (창 %d, 다단 간격 %.2f초)", *GetName(), ComboIndex + 1, *Shape.ToString(), WindowId,
+	       Payload.EventMagnitude);
+}
+
+void UVBGA_MeleeAttackBase::OnTraceWindowHits(const TArray<FHitResult>& Hits, int32 Key)
+{
+	FOpenTraceWindow* Open = OpenTraceWindows.FindByPredicate([Key](const FOpenTraceWindow& W) { return W.Key == Key; });
+	if (!Open)
+	{
+		return;   // 이미 닫은 창
+	}
+
+	for (const FHitResult& Hit : Hits)
+	{
+		VB_LOG(Log, "%s: 판정 창 %d 접촉 - %s 의 %s", *GetName(), Open->WindowId, *GetNameSafe(Hit.GetActor()),
+		       Hit.BoneName.IsNone() ? TEXT("(뼈 없음)") : *Hit.BoneName.ToString());
+	}
+
+	// 사본으로 적용하고 되돌려 쓴다. 적용 도중 이 GA 가 끝날 수 있다(예: 패링이 공격자를 끊음 -> EndAbility -> 창 목록이 비워짐).
+	//   목록의 원소를 참조로 넘기면 그때 사라진 메모리를 쓴다.
+	FSwingHitContext Context = Open->Context;
+	ApplySwingHits(Hits, Context);
+	if (FOpenTraceWindow* Still = OpenTraceWindows.FindByPredicate([Key](const FOpenTraceWindow& W) { return W.Key == Key; }))
+	{
+		Still->Context = Context;
+	}
+}
+
+void UVBGA_MeleeAttackBase::EndTraceWindowByShape(FGameplayTag Shape, bool bSweepFinalPose)
+{
+	const int32 Index = OpenTraceWindows.IndexOfByPredicate([&Shape](const FOpenTraceWindow& W) { return W.Shape == Shape; });
+	if (Index == INDEX_NONE)
+	{
+		return;   // 섹션 전환이 이미 닫았거나, 못 열어서 옛 판정으로 대신한 창
+	}
+	const int32 WindowId = OpenTraceWindows[Index].WindowId;
+	const int32 Key = OpenTraceWindows[Index].Key;
+	if (UVBMeleeTraceComponent* Trace = GetMeleeTraceComponent())
+	{
+		// 마지막 접촉의 피해 문맥은 콜백 동안 살아 있어야 한다. 패링으로 GA 가 끝나면 이 목록도 없어지므로 번호로 다시 찾는다.
+		Trace->EndWindow(WindowId, bSweepFinalPose);
+	}
+	OpenTraceWindows.RemoveAll([Key](const FOpenTraceWindow& W) { return W.Key == Key; });
+}
+
+void UVBGA_MeleeAttackBase::EndAllTraceWindows()
+{
+	if (OpenTraceWindows.Num() == 0)
+	{
+		return;
+	}
+	// 목록을 먼저 비운다 - EndWindow 가 무엇을 부르든 이 GA 의 콜백이 옛 창을 다시 찾지 못하게.
+	TArray<FOpenTraceWindow> Closing = MoveTemp(OpenTraceWindows);
+	OpenTraceWindows.Reset();
+	if (UVBMeleeTraceComponent* Trace = GetMeleeTraceComponent())
+	{
+		for (const FOpenTraceWindow& W : Closing)
+		{
+			Trace->EndWindow(W.WindowId);
 		}
 	}
 }

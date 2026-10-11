@@ -53,6 +53,52 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Trace")
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Visibility;
 
+	// === 자유 등반 (2026-09-18 단계 2) ===
+	// 등반 가능한 면만 이 채널에 Block 으로 응답한다. 기본 응답이 Ignore 라 아무 벽이나 붙지 않는다.
+	//   오브젝트 타입이 아니라 트레이스 채널인 이유: 메시의 오브젝트 타입을 바꾸면 그 메시를 보는
+	//   다른 질의(WorldStatic 스윕 등)가 전부 영향을 받는다. 응답만 켜면 이 용도에만 걸린다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	TEnumAsByte<ECollisionChannel> ClimbTraceChannel = ECC_GameTraceChannel2;
+
+	// 붙을 면을 앞에서 찾는 거리(cm). 캡슐 중심에서 바라보는 방향으로 쏜다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbProbeDistance = 100.0f;
+
+	// 붙어 있는 동안 매 틱 면을 다시 찾을 때, 목표 지점에서 면 바깥으로 물러나 쏘는 거리와 파고드는 깊이(cm).
+	//   바깥으로 물러나야 면 위의 점에서 시작해 놓치는 일이 없고, 깊이는 굴곡을 따라갈 여유다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbProbeOutset = 60.0f;
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbProbeDepth = 120.0f;
+
+	// 면이 얼마나 서 있어야 등반 대상인가. 법선의 Z 절대값이 이 값보다 작아야 한다(0.35 ≈ 70도 이상 기울어짐).
+	//   바닥(법선 Z=1)에 붙어 기어가는 것을 막는다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbMaxSurfaceTiltZ = 0.35f;
+
+	// 몸이 벽에 붙어 있는지 확인하는 두 번째 탐침의 높이(root 위로 cm).
+	// 왜 필요한가(2026-09-19 user 스크린샷): 면 검사를 root 높이 하나로만 하면 발이 벽 꼭대기에
+	//   닿을 때까지 올라가고, 그때 몸통은 이미 벽 위 허공에 있다. 좌우는 몸과 발이 같이 나가서
+	//   멈추는 것처럼 보였을 뿐이고, 검사가 좌우만 하는 게 아니라 검사 높이가 하나뿐이었다.
+	// 150 의 근거(AnimPose 실측, VB_Climb_Idle, root=발 기준): 손이 133~157, 머리가 142~150 에 있다.
+	//   그 언저리까지 벽이 있어야 「붙어 있다」가 참이다. 이 높이에서 면이 없으면 거기가 벽의 끝이다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbBodyProbeRise = 150.0f;
+
+	// 갈 수 있는 방향인지 미리 보는 거리(cm). 한 틱 이동량보다 커야 「가고 나서 막혔다」가 아니라
+	//   「가기 전에 막혔다」가 된다. 한 틱 이동은 60fps 에서 1.2cm 안팎이다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Climb")
+	float ClimbEdgeProbeAhead = 12.0f;
+
+	// 사다리를 찾는 반경(cm). 이 안에 있는 AVBLadder 중 앞쪽에 있고 마주 보는 것을 고른다.
+	//   콜리전 채널로 안 찾는 이유는 AVBLadder 주석에 있다 - 표시의 홈을 액터 하나로 모으려는 것이다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Ladder")
+	float LadderFindRadius = 220.0f;
+
+	// 사다리를 마주 보고 있다고 볼 각도의 코사인. 0.5 = 60도 안.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Ladder")
+	float LadderFacingDot = 0.5f;
+
 	// === Step4.1 판정 (GASP exact) ===
 	// ObstacleDepth 임계: < 값 → 얇음(Vault/Hurdle), >= 값 → 두꺼움(Mantle)
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Decision")
@@ -96,6 +142,12 @@ public:
 	//   애니 선택용이다. 측정 목적이 달라 함께 움직일 이유가 없다.
 	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Trace")
 	float FrontFloorProbeExtraDepth = 50.0f;
+
+	// === 매달림 (Vowbound 확장 2026-09-18) ===
+	// 놓은 직후 같은 렛지를 다시 잡지 못하는 시간(s). 점프 키를 쥔 채 놓으면 바로 아래 틱에 공중 체크가
+	//   같은 렛지를 다시 물어 «놓았는데 안 떨어짐» 이 된다. 자세 기하·속도는 클립의 성질이라 UVBClimbAnimSet 에 있다.
+	UPROPERTY(EditDefaultsOnly, Category="Vowbound|Traversal|Hang")
+	float HangRegrabDelay = 0.5f;
 
 	// === 서버 검증 ===
 	// 클라가 보낸 렛지/워프 좌표가 서버 캐릭터에서 떨어져 있어도 되는 최대 거리(cm). 초과하면 트래버설을 거부한다.

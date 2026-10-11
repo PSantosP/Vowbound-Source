@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Narrative/Story/VBStoryState.h"
 #include "VBSaveGameTypes.generated.h"
 
 /**
@@ -68,7 +69,8 @@ struct FVBProgressSaveData
 	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Progress")
 	double PlayTimeSeconds = 0.0;
 
-	// 달성한 스토리/퀘스트 플래그 집합 (예: "Quest.Intro.Cleared"). 켜진 것만 보관.
+	// 쓰는 곳 없음(2026-09-28 소스 검색 0). 사실은 아래 Story 가 잇는다 - 태그라 이름을 바꿔도 리다이렉트로 따라온다(설계 .sw/narrative 2.1절).
+	//   지우지 않는 이유: 저장 형식은 append-only 다. 필드를 빼면 옛 슬롯을 읽을 때 그 자리를 건너뛰는 규칙에 기대게 된다.
 	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Progress")
 	TSet<FName> StoryFlags;
 
@@ -81,6 +83,16 @@ struct FVBProgressSaveData
 	// (New Game / 위치 미기록 세이브 / 기존 v1 슬롯 — append-only 하위호환의 안전 폴백).
 	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Progress")
 	bool bHasSavedTransform = false;
+
+	// 상호작용 대상의 켜짐 상태(문 열림·스위치 켜짐 등). 키 = UVBInteractableComponent::GetSaveKey.
+	// 쓰는 쪽 = UVBSaveGameSubsystem::SaveCurrentGameToSlot(UVBInteractableSubsystem::CollectSavedStates),
+	// 읽는 쪽 = AVBGameMode 의 Continue 적용(UVBInteractableSubsystem::ApplySavedStates). append-only - 옛 슬롯은 비어 있다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Progress")
+	TMap<FName, bool> InteractableStates;
+
+	// 세계 사실·카운터. 쓰고 읽는 쪽 = UVBStoryStateComponent(저장 참여자). append-only - 옛 슬롯은 비어 있다(= 아무 사실도 없음).
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Progress")
+	FVBStoryState Story;
 };
 
 /**
@@ -107,6 +119,146 @@ struct FVBPlayerBuildSaveData
 	// 현재 장착 무기 식별자.
 	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Build")
 	FName EquippedWeaponId;
+
+	// 가진 무기(UVBWeaponStateComponent::OwnedWeapons, 설계 .sw/prologue-opening 3.1). EVBWeaponType 의 이름 문자열 - EquippedWeaponId 와 같은 안정 식별자.
+	//   bOwnedWeaponsSaved 가 거짓이면 이 칸이 생기기 전의 옛 세이브다 - 복원은 맵 시작값을 그대로 둔다. «빈 목록 = 맨몸» 과 구별하려고 둘을 둔다.
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Build")
+	TArray<FName> OwnedWeaponIds;
+
+	UPROPERTY(SaveGame, BlueprintReadWrite, Category="Vowbound|Save|Build")
+	bool bOwnedWeaponsSaved = false;
+};
+
+/** 가진 아이템 한 줄. 자산 경로가 아니라 ItemId 태그로 적는다(UVBItemDefinition 주석 - 자산을 옮겨도 옛 슬롯이 비지 않는다). */
+USTRUCT(BlueprintType)
+struct FVBSavedItem
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Inventory")
+	FGameplayTag ItemId;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Inventory")
+	int32 Count = 0;
+};
+
+/** 인벤토리 구역. 쓰고 읽는 쪽 = UVBInventoryComponent(저장 참여자). 옛 슬롯은 비어 있다(= 빈손). */
+USTRUCT(BlueprintType)
+struct FVBInventorySaveData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Inventory")
+	TArray<FVBSavedItem> Items;
+
+	// 퀵슬롯 칸마다 ItemId(칸 순서, 빈 칸 = 빈 태그). 덧붙인 칸이라 옛 슬롯은 빈 배열 = 모든 칸이 빈다(설계 .sw/quickslot-input 4.1절).
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Inventory")
+	TArray<FGameplayTag> QuickSlots;
+};
+
+/** 장비 구역. 쓰고 읽는 쪽 = UVBEquipmentComponent(저장 참여자, .sw/remaining-features/b1-equipment.md). 옛 슬롯은 빈 배열 = 아무것도 안 입음. */
+USTRUCT(BlueprintType)
+struct FVBEquipmentSaveData
+{
+	GENERATED_BODY()
+
+	// 칸마다 입은 아이템의 ItemId(칸 순서 = SlotLayout, 빈 칸 = 빈 태그).
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Equipment")
+	TArray<FGameplayTag> Slots;
+};
+
+/** 성장 구역. 쓰고 읽는 쪽 = UVBProgressionComponent(.sw/remaining-features/b2-growth.md). 레벨·남은 포인트는 저장하지 않는다 - 이 둘에서 센다. 옛 슬롯 = 0 / 빈 목록. */
+USTRUCT(BlueprintType)
+struct FVBGrowthSaveData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Growth")
+	int32 TotalXP = 0;
+
+	// 연 스킬 칸(NodeId). 연 순서대로.
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Growth")
+	TArray<FGameplayTag> Unlocked;
+};
+
+/** 일지의 한 줄. 정의는 QuestId 태그로 되찾는다(아이템과 같은 판단 - 자산을 옮겨도 슬롯이 안 빈다). */
+USTRUCT(BlueprintType)
+struct FVBSavedQuest
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Quest")
+	FGameplayTag QuestId;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Quest")
+	bool bCompleted = false;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Quest")
+	int32 StageIndex = 0;
+
+	// 지금 단계의 목표별 진행.
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Quest")
+	TArray<int32> Progress;
+};
+
+/** 퀘스트 구역. 쓰고 읽는 쪽 = UVBQuestLogComponent(저장 참여자). 옛 슬롯은 비어 있다(= 받은 퀘스트 없음). */
+USTRUCT(BlueprintType)
+struct FVBQuestSaveData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Quest")
+	TArray<FVBSavedQuest> Quests;
+};
+
+/** 상점 한 곳에서 아이템 하나를 판 수. 상점·아이템 모두 태그로 적는다(아이템과 같은 판단 - 자산을 옮겨도 슬롯이 안 빈다). */
+USTRUCT(BlueprintType)
+struct FVBSavedShopSale
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Shop")
+	FGameplayTag ShopId;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Shop")
+	FGameplayTag ItemId;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Shop")
+	int32 Sold = 0;
+};
+
+/** 상점 재고 구역. 쓰고 읽는 쪽 = UVBShopStateSubsystem(저장 참여자). 옛 슬롯은 비어 있다(= 아무것도 안 팔림). */
+USTRUCT(BlueprintType)
+struct FVBShopSaveData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Shop")
+	TArray<FVBSavedShopSale> Sales;
+};
+
+/** 서랍장 하나에 남은 것. 빈 Remaining 도 적는다 - «다 털림» 이고, 기록이 없는 «아직 안 굴림» 과 다르다(.sw/narrative 14.5 W1). */
+USTRUCT(BlueprintType)
+struct FVBSavedLootContainer
+{
+	GENERATED_BODY()
+
+	// 서랍장 상호작용 대상의 저장 키(기본 = 액터 이름 - 켜짐 저장과 같은 키).
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Loot")
+	FName Key;
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Loot")
+	TArray<FVBSavedItem> Remaining;
+};
+
+/** 서랍장 남은 몫 구역. 쓰고 읽는 쪽 = UVBLootContainerSubsystem(저장 참여자). 옛 슬롯은 비어 있다(= 아무 서랍장도 안 굴림). */
+USTRUCT(BlueprintType)
+struct FVBLootContainerSaveData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame, BlueprintReadOnly, Category="Vowbound|Save|Loot")
+	TArray<FVBSavedLootContainer> Containers;
 };
 
 /**

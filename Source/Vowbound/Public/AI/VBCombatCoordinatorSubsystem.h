@@ -81,6 +81,9 @@ struct FVBCombatGroup
 
 	// 그룹당 1개. Tick 을 쓰지 않는 대신 이 타이머가 역할/슬롯을 재계산한다(NFR2).
 	FTimerHandle RecomputeTimer;
+	// 다음 토큰을 줄 수 있는 월드 시각(초). 토큰 반납 시 그 멤버 아키타입의 PostAttackPauseSeconds(±편차)로 세운다.
+	//   배분 단계가 이 시각 전에는 토큰을 주지 않는다 - «스윙과 스윙 사이의 숨»(2026-09-06).
+	double NextGrantAllowedTime = 0.0;
 };
 
 /**
@@ -141,13 +144,6 @@ public:
 	// 왜 역할에서 역산하지 않는가: 역할은 토큰에서 파생된 값이라, 역으로 읽으면 파생 방향이 뒤집혀
 	//   역할 규칙을 바꾸는 순간 토큰 보유 판정이 조용히 함께 바뀐다.
 	int32 GetHeldTokenCost(const UVBEnemyCombatComponent* Member) const;
-
-	// 진단용 - 이 타겟 그룹의 잔여 토큰. 캐시가 아니라 매번 멤버 보유량의 합으로 계산한다.
-	//   캐시 카운터를 두면 반환 경로를 하나만 빠뜨려도 영원히 줄어드는 누수가 표현 가능해진다.
-	// 블루프린트에 노출하지 않는다: 매 호출이 멤버 수만큼의 합산이라, BP 가 위젯 틱이나
-	//   Event Tick 에서 부르면 빈도에 상한이 없는 O(N) 순회가 된다. 진단은 C++ 과 디버거로 한다.
-	//   BP 에서 정말 필요해지면 그때 캐시된 값을 내보내는 별도 경로를 만든다(이 함수를 여는 게 아니라).
-	int32 GetAvailableTokens(const AActor* Target) const;
 
 private:
 	// 타이머 콜백. 그룹 참조가 아니라 타겟 키를 나른다 - TMap 은 재해싱 시 값의 주소가 바뀌므로

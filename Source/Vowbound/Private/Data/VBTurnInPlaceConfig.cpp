@@ -131,10 +131,16 @@ bool UVBTurnInPlaceConfig::ResolveStepRequest(EVBWeaponType InPoseWeapon, bool b
 		OutStepYaw = InRemainingYaw;
 		return true;
 	}
-	// 상한을 넘는다: 첫 조각은 «상한 바로 아래» 와 «나머지가 진입 각 이상이 되게 남기는 값» 중 작은 쪽.
-	//   예) 상한 225, 진입 90, 남은 250 -> 첫 조각 160, 나머지 90. 남은 320 -> 첫 조각 224.9, 나머지 95.
+	// 상한을 넘는다. 나머지가 진입 각 이상이 될 수 있으면(남은 - 진입 >= 진입) 그렇게 남기고, 아니면 첫 조각을 최대로 내
+	//   나머지를 최소로 만든다 - 어차피 못 내는 나머지라면 작을수록 낫다.
+	//   예) 서있기(상한 225, 진입 90): 남은 250 -> 160 + 90. 크라우치(진입 150): 남은 250 -> 224.9 + 25.1.
+	//   종전 식 max(진입, min(상한, 남은-진입)) 은 크라우치 250 에서 150 을 내고 100 을 남겼다(2026-09-05 user PIE 로그 3건) -
+	//   진입 각 아래라 아무도 안 돌리고 캐릭터가 카메라를 100도 덜 본 채 섰다.
 	//   RequestMax 는 배타(미만) 라 상한에서 조금 뺀다.
-	const float StepMag = FMath::Max(EnterYaw, FMath::Min(Largest - 0.1f, RemainingMag - EnterYaw));
+	const bool  bRestServable = (RemainingMag - EnterYaw) >= EnterYaw;
+	const float StepMag = bRestServable
+		? FMath::Min(Largest - 0.1f, RemainingMag - EnterYaw)
+		: FMath::Min(Largest - 0.1f, RemainingMag);
 	OutStepYaw = RequestedSign * StepMag;
 	return true;
 }

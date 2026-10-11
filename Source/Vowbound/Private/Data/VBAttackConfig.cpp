@@ -4,6 +4,14 @@
 #include "Data/VBAttackConfig.h"
 
 #include "AbilitySystem/Abilities/VBWeaponStyleBehavior.h"
+#include "AbilitySystem/VBGameplayTags.h"
+
+UVBAttackConfig::UVBAttackConfig()
+{
+	// 답의 기본은 «막을 수 있다». 네이티브 태그는 헤더 멤버 초기화로 못 넣어 생성자에서 준다(GA 의 InputTag 와 같은 관례).
+	// 비워 두면 예고 큐가 답 행을 못 찾아 경고를 찍는다 - 기본값이 그 경고를 없는 자산에서까지 막는다.
+	AttackAnswer = VBGameplayTags::Attack_Answer_Parryable;
+}
 
 namespace
 {
@@ -47,4 +55,12 @@ FVBAttackMontageVariant UVBAttackConfig::ResolveMontageVariant(int32 VariantInde
 	// 음수 커서도 안전하게 감싼다. 호출부가 범위를 지킬 의무를 없앤다.
 	const int32 Index = ((VariantIndex % All.Num()) + All.Num()) % All.Num();
 	return All[Index];
+}
+
+float UVBAttackConfig::GetVariantApproachOffset(int32 VariantIndex, float BodyScale) const
+{
+	// 0번(AttackMontage)은 CollectVariants 가 기본 구조체로 만들므로 override 가 -1 이라 자산 값으로 떨어진다.
+	const FVBAttackMontageVariant Variant = ResolveMontageVariant(VariantIndex);
+	const float Base = Variant.WarpApproachOffsetOverride >= 0.0f ? Variant.WarpApproachOffsetOverride : WarpApproachOffset;
+	return FMath::Clamp(Base * BodyScale, 0.0f, FMath::Max(0.0f, GetScaledAttackRange(BodyScale)));
 }

@@ -68,6 +68,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Vowbound|TimeControl")
 	static void SetActorDilation(AActor* Actor, float Scale);
 
+	// 액터 단위 timed 요청 (2026-09-05 히트스톱 «전투원 한정»). 전역과 같은 규칙: Handle 로 교체, min-wins, 실시간 만료.
+	//   만료 타이머는 월드 시간이라 전역 배율(AppliedScale)만 곱한다 - 액터 배율은 월드 타이머에 영향이 없다.
+	//   액터가 사라지면 요청도 버린다(약참조). 마지막 요청이 빠지면 CustomTimeDilation 을 1.0 으로 되돌린다.
+	UFUNCTION(BlueprintCallable, Category="Vowbound|TimeControl")
+	void PushActorTimed(AActor* Actor, FName Handle, float Scale, float RealDuration);
+
 private:
 	// 활성 요청. min-wins 로 해소. Handle 로 idempotent 교체. (UObject ref 없어 UPROPERTY 불요)
 	TMap<FName, FVBTimeDilationRequest> ActiveRequests;
@@ -83,4 +89,11 @@ private:
 
 	// Handle 의 기존 만료 타이머를 clear(있으면). 교체/제거 전 호출.
 	void ClearExistingTimer(FName Handle);
+
+	// 액터별 활성 요청. 액터 약참조가 키라 GC 와 무관(UPROPERTY 불요).
+	TMap<TWeakObjectPtr<AActor>, TMap<FName, FVBTimeDilationRequest>> ActorRequests;
+	// 액터 하나의 min 을 계산해 CustomTimeDilation 에 쓴다(없으면 1.0).
+	void ResolveActor(const TWeakObjectPtr<AActor>& Actor);
+	// 액터 요청 만료 콜백.
+	void OnActorRequestExpired(TWeakObjectPtr<AActor> Actor, FName Handle);
 };

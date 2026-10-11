@@ -22,14 +22,15 @@ EDataValidationResult UVBSwingCombatProfile::IsDataValid(FDataValidationContext&
 {
 	EDataValidationResult Result = Super::IsDataValid(Context);
 
-	// 전 배율이 항등원이면 이 자산은 노티에 꽂혀도 아무 일도 하지 않는다.
+	// 전 배율이 항등원이고 등급도 덮지 않으면 이 자산은 노티에 꽂혀도 아무 일도 하지 않는다.
 	//  런타임 증상이 "배선 실패"와 똑같아서 추적이 오래 걸리는 부류다.
-	if (!Scales.HasAnyEffect())
+	//  등급 덮어쓰기(DEC-025)만 있는 자산은 유효하다 - 「마지막 타만 넘어뜨림」은 배율 없이도 성립한다.
+	if (!Scales.HasAnyEffect() && !bOverrideHitImpact)
 	{
 		Context.AddError(LOCTEXT("VBSwingCombat_NoEffect",
-			"모든 배율이 1.0 이라 이 프로필은 아무것도 바꾸지 않습니다. "
+			"모든 배율이 1.0 이고 반응 등급도 덮지 않아 이 프로필은 아무것도 바꾸지 않습니다. "
 			"노티에 꽂아도 무보정이라 배선이 잘못된 것과 증상이 같습니다. "
-			"바꾸려는 값의 배율을 넣거나, 쓰지 않을 자산이면 노티에서 빼세요."));
+			"바꾸려는 값의 배율이나 등급을 넣거나, 쓰지 않을 자산이면 노티에서 빼세요."));
 
 		Result = EDataValidationResult::Invalid;
 	}

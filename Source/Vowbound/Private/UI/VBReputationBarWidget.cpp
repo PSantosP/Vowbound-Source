@@ -17,9 +17,12 @@ void UVBReputationBarWidget::InitializeWithASC(UAbilitySystemComponent* ASC)
 	CurrentReputation = ASC->GetNumericAttribute(UVBReputationAttributeSet::GetReputationAttribute());
 
 	// 값 변화 구독. UVBHealthBarWidget::InitializeWithASC 와 같은 관용구다.
-	ASC->GetGameplayAttributeValueChangeDelegate(
-	                                             UVBReputationAttributeSet::GetReputationAttribute()
-	                                            ).AddUObject(this, &UVBReputationBarWidget::OnReputationChanged);
+	//   먼저 지우는 이유: 이 바를 품은 일시정지 메뉴는 화면 컨테이너가 재사용하므로(.sw/ui-foundation 2.1)
+	//   열 때마다 다시 불린다. 지우지 않으면 여는 횟수만큼 같은 구독이 쌓인다.
+	FOnGameplayAttributeValueChange& Changed =
+		ASC->GetGameplayAttributeValueChangeDelegate(UVBReputationAttributeSet::GetReputationAttribute());
+	Changed.RemoveAll(this);
+	Changed.AddUObject(this, &UVBReputationBarWidget::OnReputationChanged);
 
 	UpdateBar();
 }

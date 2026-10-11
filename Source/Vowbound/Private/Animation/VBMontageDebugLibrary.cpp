@@ -1,4 +1,4 @@
-// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
 
 #include "Animation/VBMontageDebugLibrary.h"
 #include "Animation/AnimMontage.h"
@@ -14,19 +14,6 @@ FName UVBMontageDebugLibrary::GetMontageSlotName(UAnimMontage* Montage)
 		return Montage->SlotAnimTracks[0].SlotName;
 	}
 	return NAME_None;
-}
-
-bool UVBMontageDebugLibrary::SetMontageSlotName(UAnimMontage* Montage, FName NewSlotName)
-{
-	// GetMontageSlotName 과 동일 경로 — SlotAnimTracks[0].SlotName 을 직접 재저작.
-	// in-place 변경: 세그먼트/notify/블렌드/워프 등 몽타주 나머지 데이터 전량 보존.
-	if (!Montage || Montage->SlotAnimTracks.Num() == 0)
-	{
-		return false;
-	}
-	Montage->SlotAnimTracks[0].SlotName = NewSlotName;
-	Montage->MarkPackageDirty();
-	return true;
 }
 
 int32 UVBMontageDebugLibrary::GetMontageSlotCount(UAnimMontage* Montage)
@@ -152,48 +139,14 @@ FString UVBMontageDebugLibrary::GetMontageWarpModifierInfo(UAnimMontage* Montage
 			{
 				Out += FString::Printf(TEXT("%s=%s "), *P->GetName(), *NP->GetPropertyValue_InContainer(Mod).ToString());
 			}
+			else if (const FFloatProperty* FP = CastField<FFloatProperty>(P))   // MaxSpeedClampRatio 등 (2026-09-06)
+			{
+				Out += FString::Printf(TEXT("%s=%.2f "), *P->GetName(), FP->GetPropertyValue_InContainer(Mod));
+			}
 		}
 		return Out;
 	}
 	return TEXT("no-warp-notify");
-}
-
-int32 UVBMontageDebugLibrary::SetMontageWarpTranslation(UAnimMontage* Montage, bool bEnable)
-{
-	if (!Montage)
-	{
-		return 0;
-	}
-	int32 Applied = 0;
-	for (const FAnimNotifyEvent& Ev : Montage->Notifies)
-	{
-		if (!Ev.NotifyStateClass)
-		{
-			continue;
-		}
-		const FObjectProperty* MP = CastField<FObjectProperty>(
-			Ev.NotifyStateClass->GetClass()->FindPropertyByName(TEXT("RootMotionModifier")));
-		if (!MP)
-		{
-			continue;
-		}
-		UObject* Mod = MP->GetObjectPropertyValue_InContainer(Ev.NotifyStateClass);
-		if (!Mod)
-		{
-			continue;
-		}
-		if (const FBoolProperty* BWP = CastField<FBoolProperty>(
-			Mod->GetClass()->FindPropertyByName(TEXT("bWarpTranslation"))))
-		{
-			BWP->SetPropertyValue_InContainer(Mod, bEnable);
-			++Applied;
-		}
-	}
-	if (Applied > 0)
-	{
-		Montage->MarkPackageDirty();
-	}
-	return Applied;
 }
 
 FString UVBMontageDebugLibrary::GetMontageSegmentAnimPath(UAnimMontage* Montage)
@@ -209,22 +162,6 @@ FString UVBMontageDebugLibrary::GetMontageSegmentAnimPath(UAnimMontage* Montage)
 	}
 	UAnimSequenceBase* Anim = Track.AnimSegments[0].GetAnimReference();
 	return Anim ? Anim->GetPathName() : TEXT("NULL");
-}
-
-bool UVBMontageDebugLibrary::SetMontageSegmentAnim(UAnimMontage* Montage, UAnimSequenceBase* Anim)
-{
-	if (!Montage || !Anim || Montage->SlotAnimTracks.Num() == 0)
-	{
-		return false;
-	}
-	FAnimTrack& Track = Montage->SlotAnimTracks[0].AnimTrack;
-	if (Track.AnimSegments.Num() == 0)
-	{
-		return false;
-	}
-	Track.AnimSegments[0].SetAnimReference(Anim, false);
-	Montage->MarkPackageDirty();
-	return true;
 }
 
 FString UVBMontageDebugLibrary::GetMontageBranchInDatabasePath(UAnimMontage* Montage)
@@ -256,33 +193,9 @@ FString UVBMontageDebugLibrary::GetMontageBranchInDatabasePath(UAnimMontage* Mon
 	return TEXT("no-BranchIn-notify");
 }
 
-bool UVBMontageDebugLibrary::SetMontageBranchInDatabase(UAnimMontage* Montage, UObject* Database)
+FName UVBMontageDebugLibrary::GetMontageSectionNext(UAnimMontage* Montage, FName SectionName)
 {
-	if (!Montage || !Database)
-	{
-		return false;
-	}
-	bool bSet = false;
-	for (const FAnimNotifyEvent& Ev : Montage->Notifies)
-	{
-		if (!Ev.NotifyStateClass)
-		{
-			continue;
-		}
-		const UClass* Cls = Ev.NotifyStateClass->GetClass();
-		if (!Cls->GetName().Contains(TEXT("PoseSearchBranchIn")))
-		{
-			continue;
-		}
-		if (const FObjectProperty* DBProp = CastField<FObjectProperty>(Cls->FindPropertyByName(TEXT("Database"))))
-		{
-			DBProp->SetObjectPropertyValue_InContainer(Ev.NotifyStateClass, Database);
-			bSet = true;
-		}
-	}
-	if (bSet)
-	{
-		Montage->MarkPackageDirty();
-	}
-	return bSet;
+	if (!Montage) return NAME_None;
+	const int32 Index = Montage->GetSectionIndex(SectionName);
+	return Montage->CompositeSections.IsValidIndex(Index) ? Montage->CompositeSections[Index].NextSectionName : NAME_None;
 }

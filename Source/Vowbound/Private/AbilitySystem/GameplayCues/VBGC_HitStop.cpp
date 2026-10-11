@@ -3,6 +3,7 @@
 #include "AbilitySystem/GameplayCues/VBGC_HitStop.h"
 #include "AbilitySystem/VBGameplayTags.h"
 #include "TimeControl/VBTimeDilationSubsystem.h"
+#include "Data/VBAttackConfig.h"   // 범위(bHitStopCombatantsOnly)·피격자 추가시간의 홈
 #include "Vowbound/Vowbound.h"
 
 namespace
@@ -62,14 +63,33 @@ bool UVBGC_HitStop::OnExecute_Implementation(AActor* MyTarget, const FGameplayCu
 	// 서로 덮어써(첫 복원이 시간을 1.0 으로 스냅 → 둘째 슬로모가 끊김) '팝'이 났다(clobbering).
 	// 이제 handle 기반 요청 → min-wins 해소 → 조정계층이 real-time 만료로 복원을 단일 소유한다.
 	// 각 클라 로컬 실행은 그대로(서브시스템도 per-world) — SP/host 거동 보존.
-	if (UVBTimeDilationSubsystem* TimeSubsystem = UVBTimeDilationSubsystem::Get(World))
-	{
-		TimeSubsystem->PushTimed(GHitStopHandle, TimeDilation, Duration);
-	}
-	else
+	UVBTimeDilationSubsystem* TimeSubsystem = UVBTimeDilationSubsystem::Get(World);
+	if (!TimeSubsystem)
 	{
 		VB_LOG(Warning, "VBGC_HitStop: TimeDilationSubsystem 없음 — 히트스톱 스킵");
+		return false;
 	}
+	// 범위 (2026-09-05, design §8): 공격 설정이 «전투원만» 이면 공격자와 맞은 액터들만 CustomTimeDilation 으로 멈춘다.
+	//   세계·카메라·다른 적은 계속 돈다 - 참고작의 히트스톱이 이것이다. 설정이 없거나(옛 호출) 전역이면 종전 경로.
+	const UVBAttackConfig* Config = Cast<UVBAttackConfig>(Parameters.SourceObject.Get());
+	if (Config && Config->bHitStopCombatantsOnly)
+	{
+		AActor* Attacker = Parameters.GetEffectCauser() ? Parameters.GetEffectCauser() : Parameters.GetInstigator();
+		if (Attacker)
+		{
+			TimeSubsystem->PushActorTimed(Attacker, GHitStopHandle, TimeDilation, Duration);
+		}
+		FGameplayEffectContextHandle Context = Parameters.EffectContext;   // GetActors() 가 non-const 라 복사해서 읽는다
+		for (const TWeakObjectPtr<AActor>& Victim : Context.GetActors())
+		{
+			if (AActor* V = Victim.Get())
+			{
+				TimeSubsystem->PushActorTimed(V, GHitStopHandle, TimeDilation, Duration + Config->HitStopVictimExtraSeconds);
+			}
+		}
+		return true;
+	}
+	TimeSubsystem->PushTimed(GHitStopHandle, TimeDilation, Duration);
 
 	return true;
 }

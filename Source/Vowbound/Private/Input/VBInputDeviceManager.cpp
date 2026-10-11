@@ -105,6 +105,18 @@ void UVBInputDeviceManager::HandleInputMethodChanged(ECommonInputType NewInputTy
 				}
 			}
 			break;
+		case ECommonInputType::Touch:
+			{
+				// 터치는 IMC 를 바꾸지 않는다 - 화면 조작(UVBTouchControls)이 입력 액션에 직접 주입하므로 매핑이 필요 없고,
+				//   켜진 IMC 를 그대로 두면 키보드·패드도 계속 된다. 알리기만 한다(HUD 가 화면 조작을 띄운다).
+				if (CurrentDeviceType != ECommonInputType::Touch)
+				{
+					CurrentDeviceType = ECommonInputType::Touch;
+					OnInputDeviceChanged.Broadcast(ECommonInputType::Touch);
+					VB_LOG(Log, "Input switched to Touch (IMC 유지)");
+				}
+			}
+			break;
 		default:
 			break;
 	}

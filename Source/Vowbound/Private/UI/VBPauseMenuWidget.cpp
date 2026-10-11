@@ -9,9 +9,18 @@
 #include "UI/VBReputationBarWidget.h"
 #include "Vowbound/Vowbound.h"
 
-void UVBPauseMenuWidget::NativeConstruct()
+UVBPauseMenuWidget::UVBPauseMenuWidget(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
 {
-	Super::NativeConstruct();
+	// 일시정지 메뉴의 계약(.sw/ui-foundation 3절): 메뉴 입력만 받고, 게임을 멈추고, 뒤로 가기로 닫힌다.
+	InputMode = EVBScreenInputMode::Menu;
+	bPausesGame = true;
+	bIsBackHandler = true;
+}
+
+void UVBPauseMenuWidget::NativeOnActivated()
+{
+	Super::NativeOnActivated();
 
 	// BP 가 바를 안 넣었으면 아무 일도 하지 않는다(BindWidgetOptional 계약).
 	if (!ReputationBar)
@@ -48,11 +57,8 @@ void UVBPauseMenuWidget::ShowSavePage()
 
 void UVBPauseMenuWidget::ResumeGame()
 {
-	// unpause + 입력모드 복원은 PC 단일 소스에서(위젯이 직접 하지 않음).
-	if (AVBPlayerController* PC = GetVBOwningController())
-	{
-		PC->ResumeGame();
-	}
+	// 화면을 끄면 스택이 내리고, 정지 해제와 입력 복귀는 UI 층이 한다(헤더 주석).
+	DeactivateWidget();
 }
 
 void UVBPauseMenuWidget::QuitToMenu()

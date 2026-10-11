@@ -4,7 +4,28 @@
 
 #include "SaveSystem/VBSaveGameSubsystem.h"
 #include "UI/VBSaveSlotListWidget.h"
+#include "Components/WidgetSwitcher.h"
 #include "Kismet/KismetSystemLibrary.h"
+
+UVBMainMenuWidget::UVBMainMenuWidget(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	// 메인 메뉴 레벨의 바닥 화면이다. 메뉴 입력만 받는다. 뒤로 가기는 하위 페이지에서 첫 화면으로 돌아가는 데만 쓰고
+	//   첫 화면에서는 아무것도 안 한다 - 이 화면이 닫히면 메뉴 레벨에 아무 화면도 없다.
+	InputMode = EVBScreenInputMode::Menu;
+	bIsBackHandler = true;
+}
+
+bool UVBMainMenuWidget::NativeOnHandleBackAction()
+{
+	// 하위 페이지면 부모(UVBMenuScreenWidget)가 첫 화면으로 되돌리고 참을 돌려준다.
+	//   첫 화면이면 부모의 부모가 화면을 끄는데, 바닥 화면이라 끄지 않고 입력만 먹는다.
+	if (MenuSwitcher && MenuSwitcher->GetActiveWidgetIndex() != PageIndex_Main)
+	{
+		return Super::NativeOnHandleBackAction();
+	}
+	return true;
+}
 
 // "가장 최근 슬롯" 정책은 UVBSaveGameSubsystem 이 소유한다. 아래 둘은 얇은 위임일 뿐이다.
 // 왜: 게임오버 "계속하기"(AVBPlayerController::ContinueFromLastSave)가 같은 정책을 필요로 하는데, 정책이

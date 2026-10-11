@@ -22,7 +22,12 @@ class VOWBOUND_API UVBGA_Crouch : public UVBGameplayAbility
 	GENERATED_BODY()
 public:
 	UVBGA_Crouch();
-	
+
+	// 몸통을 쓰는 동작의 태그 묶음 - 이 중 하나라도 있으면 앉기·일어서기를 둘 다 막는다(설계 .sw/crouch-montage 2.1).
+	//   앉기는 이 능력의 ActivationBlockedTags 가, 일어서기(토글 끄기 - 막기 태그를 안 탄다)는 AVBCharacter::HandleCrouchPressed 가 같은 묶음을 묻는다.
+	//   왜 막나: 이 능력은 캡슐만 바꾸고 돌고 있는 몽타주를 멈추지 않는다 - 전신 몽타주 도중에 바꾸면 «서기 몽타주 + 앉은 캡슐» 이 된다(user PIE 10-02).
+	static const FGameplayTagContainer& GetPostureBlockingTags();
+
 private:
 	virtual void ExecuteAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;

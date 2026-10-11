@@ -3,11 +3,14 @@
 
 #include "AbilitySystem/Abilities/VBGA_Dodge.h"
 #include "AbilitySystem/VBGameplayTags.h"
+#include "AbilitySystemComponent.h" // SetLooseGameplayTagCount - 회피 커밋 태그
 #include "Character/VBCharacter.h"
 #include "Character/VBWeaponStateComponent.h"
 #include "GameFramework/Character.h"
+#include "Components/CapsuleComponent.h"   // 앉은 채 회피 첫 프레임 로그의 캡슐 반높이
 #include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
 #include "Animation/AnimMontage.h"
+#include "Vowbound/Vowbound.h"   // VB_LOG
 
 EVBDodgeDirection UVBGA_Dodge::ResolveDirection(const AActor* Avatar, const FVector& WorldDir)
 {
@@ -35,14 +38,23 @@ UVBGA_Dodge::UVBGA_Dodge()
 	// NetExecutionPolicy: 베이스(VBGameplayAbility) ServerInitiated 상속 (2026-04-20 전환 후 명시 오버라이드 제거)
 	ActivationOwnedTags.AddTag(VBGameplayTags::State_Combat_Dodging);
 
+	// 이 어빌리티가 «무엇인가» 를 말하는 자산 태그. 남이 이것을 차단 목록으로 걸 때 쓰는 이름이다.
+	//
+	// 왜 BP 가 아니라 여기인가: 이것은 튜닝값이 아니라 클래스의 정체다. BP 저작에 맡겼더니 실제로
+	//   안 버텼다 - 2026-09-13 실측으로 어빌리티 BP 19개 중 10개가 비어 있었고, 그중 하나가 이것이라
+	//   UVBGA_Execute 의 Ability.Defense 차단이 회피에만 조용히 무동작이었다(가드는 걸렸다).
+	//   BP 에 한 번 넣어 봤지만 에디터 재시작을 못 넘겼다 - 저장 경로에 기대는 것 자체가 약한 자리다.
+	// 부작용: 없다. 태그가 늘 뿐이고 이 GA 의 동작은 안 바뀐다.
+	AbilityTags.AddTag(VBGameplayTags::Ability_Defense_Dodge);
+
 	// 활성화 게이트 신설 (FIND-054 동반 발견, 2026-07-26)
 	// 회피는 그동안 ActivationBlockedTags 가 하나도 없어 사망 중에도 활성화됐다. 다른 GA 는 전부 사망을
 	// 막으므로(VBGA_Guard.cpp:32 / VBGA_HitReact.cpp:50 / VBGA_WeaponSummon.cpp:15) Dodge 도 규칙에 편입한다.
 	//
 	// 이 게이트는 살아 있다(2026-08-14 정정). 종전 주석은 "State.Dead 부여처가 적 하나뿐이고 플레이어
 	//   사망은 미구현이라 발동하지 않는다"고 적었는데, 지금은 셋 다 거짓이다 — AVBCharacter::HandleDeath
-	//   (VBCharacter.cpp:221)가 존재하고 :228 에서 State.Dead 를 부여한다. 적 쪽도 부여처가 둘이다
-	//   (VBEnemyBase.cpp:242 / :272). 죽은 게이트로 오인해 제거하지 말 것.
+	//   (VBCharacter.cpp::AVBCharacter::HandleDeath)가 존재하고 거기서 State.Dead 를 부여한다. 적 쪽도 부여처가 둘이다
+	//   (VBEnemyBase.cpp::AVBEnemyBase::HandleDeath / ::MulticastHandleDeathCosmetic_Implementation). 죽은 게이트로 오인해 제거하지 말 것.
 	//
 	// State.Combat.Guarding 은 일부러 넣지 않는다. 가드 캔슬 회피는 의도된 동작이다(user 확정 2026-07-26).
 	//   한 번 넣었다가 되돌린 이력이 있으니 "공격은 막는데 회피는 왜 안 막나"라는 대칭 논리로 재추가 금지.
@@ -54,6 +66,12 @@ UVBGA_Dodge::UVBGA_Dodge()
 	// 알려진 잔여(수용됨): 회피가 가드 몽타주를 같은 DefaultSlot 에서 덮으므로, 회피 후 RMB 를 계속 쥐고 있어도
 	//   가드 포즈는 돌아오지 않는다(BeginGuard 는 GA 활성 시 1회만 호출). 가드 '상태'는 유지되므로 판정은 정상.
 	ActivationBlockedTags.AddTag(VBGameplayTags::State_Dead);
+
+	// 앉은 채 회피하면 일어서며 회피한다(설계 .sw/crouch-montage 2.3 - 공격과 같은 규칙 «행동은 서서 한다»).
+	//   회피 몽타주는 서기 전신 클립이라 앉은 캡슐 위에서 돌면 다리가 땅에 박히고 끝나면 앉기로 튄다(감사 2026-10-03).
+	//   앉기 능력이 끝나면 그 EndAbility 가 양쪽에서 UnCrouch 한다. 무적 창 때문에 공격처럼 «선 뒤에» 로 미루지 않는다 -
+	//   캡슐 높이가 다음 이동 틱에 돌아오는 한 틱의 어긋남은 받아들인다(PIE 확인 항목).
+	CancelAbilitiesWithTag.AddTag(VBGameplayTags::Ability_Locomotion_Crouch);
 }
 
 void UVBGA_Dodge::ExecuteAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
@@ -76,6 +94,15 @@ void UVBGA_Dodge::ExecuteAbility(const FGameplayAbilitySpecHandle Handle, const 
 	{
 		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
 		return;
+	}
+
+	// 앉은 채 시작한 회피의 첫 프레임을 남긴다(설계 .sw/crouch-montage 2.3, Codex 01 검토 10-03). 앉기는 활성화 때 이미 취소돼 UnCrouch 가 나갔지만
+	//   캡슐은 이동 틱이 실제로 세운다 - 그 사이 서기 회피 몽타주가 앉은 캡슐 위에 한 틱이라도 있었는지는 PIE 로만 보인다. 이 줄이 그 자리의 상태다.
+	if (AvatarCharacter->bIsCrouched)
+	{
+		VB_LOG(Log, "회피: 앉은 채 시작 - 앉기 취소됨, 캡슐 반높이 %.1f(아직 앉은 높이), 이동 틱에 선다 [%s]",
+			AvatarCharacter->GetCapsuleComponent() ? AvatarCharacter->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : -1.0f,
+			bIsServer ? TEXT("서버") : TEXT("클라"));
 	}
 
 	if (AVBCharacter* VBChar = Cast<AVBCharacter>(AvatarCharacter))
@@ -154,6 +181,15 @@ void UVBGA_Dodge::ExecuteAbility(const FGameplayAbilitySpecHandle Handle, const 
 										 true);
 	}
 
+	// 회피 커밋 (design §7): 캐릭터가 서버 ASC 에 DodgeCommit 태그를 세우고 AttackCancelSeconds 뒤 푼다. 타이머의 주인이 캐릭터인 이유는 헤더 주석.
+	if (bIsServer && DodgeConfig->AttackCancelSeconds > 0.0f)
+	{
+		if (AVBCharacter* VBChar = Cast<AVBCharacter>(AvatarCharacter))
+		{
+			VBChar->BeginDodgeCommit(DodgeConfig->AttackCancelSeconds, DodgeConfig->AttackBufferSeconds);
+		}
+	}
+
 	// Timer→EndAbility 는 서버 전용: 서버 권위로 종료 시 ClientEndAbility RPC로 클라에 전파됨.
 	// 클라 자체 타이머는 이중 종료 위험. 이 타이머가 무적창(State.Combat.Dodging)의 수명이다.
 	if (bIsServer)
@@ -183,6 +219,15 @@ void UVBGA_Dodge::EndAbility(const FGameplayAbilitySpecHandle     Handle, const 
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(DodgeTimerHandle);
+	}
+	// 취소로 끝났으면(피격 등) 커밋도 즉시 푼다 - 저장된 공격 입력은 버린다(플린치에서 공격이 튀어나오지 않게).
+	// 정상 종료(무적 타이머)는 커밋을 그대로 둔다 - 커밋(0.45)이 무적(0.4)보다 길고, 그 타이머는 캐릭터가 쥐고 있어 여기서 안 지워진다.
+	if (bWasCancelled && ActorInfo && ActorInfo->IsNetAuthority())
+	{
+		if (AVBCharacter* VBChar = Cast<AVBCharacter>(GetAvatarActorFromActorInfo()))
+		{
+			VBChar->CancelDodgeCommit();
+		}
 	}
 	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }

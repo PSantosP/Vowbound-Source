@@ -1,4 +1,6 @@
-﻿#pragma once
+﻿// VowBound: The Oath of the Scalpel Copyright (c) 2025. All Rights Reserved.
+
+#pragma once
 
 #include "CoreMinimal.h"
 #include "VBMatchState.generated.h"

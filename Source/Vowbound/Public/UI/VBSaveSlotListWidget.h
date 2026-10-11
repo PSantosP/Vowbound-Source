@@ -92,9 +92,15 @@ private:
 	UFUNCTION()
 	void HandleEntryDelete(int32 SlotIndex);
 
-	// 저장 완료(비동기) 후 목록 갱신. 방금 쓴 타임스탬프를 화면에 반영한다.
+	// 저장 완료(비동기) 후 목록 갱신. 방금 쓴 타임스탬프를 화면에 반영한다. 기다리는 슬롯이 아니면 무시한다.
 	UFUNCTION()
 	void HandleSaveCompleted(int32 SlotIndex, bool bSuccess);
+
+	// 이 화면이 저장을 걸고 완료를 기다리는 슬롯. 없으면 INDEX_NONE. 완료 통지는 (슬롯, 성공) 뿐이라
+	//   다른 길(저장 포인트 등)이 다른 슬롯에 쓴 완료를 이것으로 거른다 - 같은 슬롯의 겹친 저장은 가르지 못한다.
+	//   대기는 한 칸, 마지막 요청이 이긴다(SelectSlot 주석). 메뉴가 화면을 숨겨도 위젯은 살아 있어(메뉴 전환기가 자식을 재사용) 숨긴 채 완료를 받고
+	//   목록을 다시 짓는다 - 다시 열 때 최신이라 그대로 둔다. 구독이 저절로 풀리는 것은 위젯 객체가 실제로 사라질 때뿐이다.
+	int32 PendingSaveSlot = INDEX_NONE;
 
 	// 모드에 따라 제목 문구를 맞춘다.
 	void RefreshTitle();

@@ -59,3 +59,22 @@ void UVBMenuScreenWidget::ShowMainPage()
 {
 	SwitchToPage(PageIndex_Main);
 }
+
+void UVBMenuScreenWidget::NativeOnActivated()
+{
+	Super::NativeOnActivated();
+	if (MenuSwitcher)
+	{
+		MenuSwitcher->SetActiveWidgetIndex(PageIndex_Main);
+	}
+}
+
+bool UVBMenuScreenWidget::NativeOnHandleBackAction()
+{
+	if (MenuSwitcher && MenuSwitcher->GetActiveWidgetIndex() != PageIndex_Main)
+	{
+		ShowMainPage();
+		return true;
+	}
+	return Super::NativeOnHandleBackAction();
+}
